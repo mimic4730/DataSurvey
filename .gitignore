@@ -1,0 +1,16 @@
+# バイトコード
+__pycache__/
+*.py[cod]
+
+# 仮想環境
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
