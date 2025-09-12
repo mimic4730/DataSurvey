@@ -1,5 +1,6 @@
 # core/sampling.py
 import pandas as pd
+import unicodedata, re
 from .file_keys import COL_KUBUN, COL_LOCAL_PUB_UUID, SAMPLE_SIZE
 
 def normalize_patient_code_series(s: pd.Series) -> pd.Series:
@@ -43,3 +44,11 @@ def sample_by_patient_code(df: pd.DataFrame, code_col: str, n: int = SAMPLE_SIZE
     if df_unique.empty:
         return df.head(0)
     return df_unique.sample(n=min(n, len(df_unique)), random_state=None)
+
+def normalize_patient_code_series(s: pd.Series) -> pd.Series:
+    def _norm(x):
+        x = unicodedata.normalize("NFKC", str(x)).strip()
+        # Unicodeの数字以外を最小限に（必要に応じて調整）
+        x = re.sub(r"[^\w\-]", "", x)  # 記号類の大半削除（院の方針に合わせ調整可）
+        return x
+    return s.dropna().map(_norm)

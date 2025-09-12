@@ -13,9 +13,11 @@ from core.file_keys import (
 from core.sampling import (
     normalize_patient_code_series, sample_unique_by_col, sample_by_patient_code
 )
+from core.naming import find_patient_code_column
 from .dialogs import ColumnSelectDialog
 from .tables import DualTablesView
 from .loading import LoadingOverlay
+
 
 
 class DataSurveyApp(tk.Tk):
@@ -129,15 +131,22 @@ class DataSurveyApp(tk.Tk):
                 })
                 continue
 
-            # 患者コード列 推定 or ダイアログ
+            # ▼▼ 患者コード列 推定（順序：厳密一致 → 正規化一致 → ダイアログ） ▼▼
             code_col = None
+
+            # (1) 厳密一致（候補にそのまま一致）
             for cand in PATIENT_CODE_CANDIDATES:
                 if cand in df.columns:
                     code_col = cand
                     break
+
+            # (2) 正規化マッチ（モジバケ・揺れ対応）
+            if code_col is None:
+                code_col = find_patient_code_column(df.columns)
+
+            # (3) ダイアログ（最後の手段）
             if code_col is None:
                 cols = list(df.columns)
-                # ダイアログはメインスレッドで開く必要があるため after で同期的に取得
                 code_col = self._ask_code_col_sync(name, cols)
 
             files_info.append({
@@ -148,7 +157,7 @@ class DataSurveyApp(tk.Tk):
                 "sample_df": pd.DataFrame(),
             })
 
-        # サンプリング
+        # （以下サンプリング処理はそのまま）
         for info in files_info:
             df = info["df"]; code_col = info["code_col"]; key = info["key"]
             if df.empty or not code_col:
