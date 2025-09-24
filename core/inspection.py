@@ -303,14 +303,21 @@ def build_inspection_df(
 def to_csv(
     df: pd.DataFrame,
     path: str,
-    encoding: str = "cp932",
+    encoding: str | None = None,
     index: bool = False,
     encoding_errors: str = "replace",
 ) -> None:
     """
-    検収用CSVとして出力（Windows-31J互換のcp932が無難）。
-    pandas の古いバージョンでは DataFrame.to_csv に encoding_errors が無いので、
-    Python のテキストIO側で errors を制御して安全に書き込みます。
+    CSV出力（プラットフォームに応じて既定エンコーディングを切替）
+    - Windows: cp932（Excel互換）
+    - 非Windows: utf-8-sig（Excel/Mac・他ツール互換）
+    明示指定があれば `encoding` を優先。
+    `errors` は Python 側で制御して安全に書き込みます。
     """
+    import os, sys
+    if encoding is None:
+        # Windows なら cp932、その他は UTF-8 BOM 付き
+        encoding = "cp932" if os.name == "nt" or sys.platform.startswith("win") else "utf-8-sig"
+
     with open(path, "w", encoding=encoding, errors=encoding_errors, newline="") as f:
         df.to_csv(f, index=index)
