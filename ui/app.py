@@ -1,7 +1,7 @@
 # ui/app.py
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -28,6 +28,10 @@ class DataSurveyApp(tk.Tk):
         self.geometry("1300x700")
         self.resizable(True, True)
         self.actions = InspectionActions(self)
+        self.log_text = None
+        self.pages = None
+        self.page_extract = None
+        self.page_inspect = None
         self._build_widgets()
         self._loader = None  # LoadingOverlay
         self._bg_thread = None
@@ -46,24 +50,110 @@ class DataSurveyApp(tk.Tk):
         menubar.add_cascade(label="検収", menu=inspection_menu)
 
     def _build_widgets(self):
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=10, pady=10)
+        # ページ（抽出/検収）
+        self.pages = ttk.Notebook(self)
+        self.pages.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # === 抽出ページ ===
+        self.page_extract = ttk.Frame(self.pages)
+        self.pages.add(self.page_extract, text="サンプル抽出")
+
+        top_extract = ttk.Frame(self.page_extract)
+        top_extract.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(
-            top,
+            top_extract,
             text="4つのCSVを読み込み：各ファイルで抽出5件（特殊条件）/ 下段に他ファイル抽出コード一致レコードを表示。"
         ).pack(side="left")
 
-        # 右側のボタン群
-        right_btns = ttk.Frame(top)
-        right_btns.pack(side="right")
-        ttk.Button(right_btns, text="CSVを選択（4ファイル）", command=self.load_and_display).pack(side="left", padx=(0,6))
-        ttk.Button(right_btns, text="検収CSV生成(患者)", command=self.actions.run_patient).pack(side="left", padx=(0,6))
-        ttk.Button(right_btns, text="検収CSV生成(保険)", command=self.actions.run_insurance).pack(side="left", padx=(0,6))
-        ttk.Button(right_btns, text="検収CSV生成(公費)", command=self.actions.run_public).pack(side="left")
+        ttk.Button(top_extract, text="CSVを選択（4ファイル）", command=self.load_and_display).pack(side="right")
 
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(expand=True, fill="both", padx=10, pady=(0,10))
+        # サンプル抽出の結果ノート（従来のself.notebookをこちらに配置）
+        self.result_notebook = ttk.Notebook(self.page_extract)
+        self.result_notebook.pack(expand=True, fill="both", padx=10, pady=(0,10))
+
+        # === 検収ページ ===
+        self.page_inspect = ttk.Frame(self.pages)
+        self.pages.add(self.page_inspect, text="検収")
+
+        top_inspect = ttk.Frame(self.page_inspect)
+        top_inspect.pack(fill="x", padx=10, pady=(10,6))
+
+        ttk.Label(top_inspect, text="検収CSVの生成・突合を実行（ログは下部に出力）").pack(side="left")
+        # ▼ 追加: データ移行日入力（検収全体で共通に使用）
+        right_controls = ttk.Frame(top_inspect)
+        right_controls.pack(side="right")
+        ttk.Label(right_controls, text="データ移行日").pack(side="left", padx=(0,4))
+        self.migration_entry = ttk.Entry(right_controls, width=14)
+        # 既定値は本日。検収実行時に InspectionActions がこの値を参照して期限切れ判定などに利用
+        self.migration_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self.migration_entry.pack(side="left")
+        # InspectionActions に値取得プロバイダを渡す
+        if hasattr(self.actions, "set_migration_provider"):
+            self.actions.set_migration_provider(lambda: self.migration_entry.get())
+
+        btns = ttk.Frame(self.page_inspect)
+        btns.pack(fill="x", padx=10, pady=(0,6))
+        ttk.Button(btns, text="検収CSV生成(患者)", command=self.actions.run_patient).pack(side="left", padx=(0,6))
+        ttk.Button(btns, text="検収CSV生成(保険)", command=self.actions.run_insurance).pack(side="left", padx=(0,6))
+        ttk.Button(btns, text="検収CSV生成(公費)", command=self.actions.run_public).pack(side="left")
+
+        # ログテキスト（積み上げ式）
+        log_frame = ttk.LabelFrame(self.page_inspect, text="ログ")
+        log_frame.pack(expand=True, fill="both", padx=10, pady=(4,10))
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", height=12)
+        self.log_text.pack(expand=True, fill="both", padx=8, pady=8)
+
+        # InspectionActions にロガーを提供
+        if hasattr(self.actions, "set_logger"):
+            self.actions.set_logger(self._log)
+
+        # 起動時のヘルプを表示
+        self._insert_welcome_text()
+
+    def _insert_welcome_text(self):
+        """起動時に検収ページのログ欄へヘルプを表示する。"""
+        if not getattr(self, "log_text", None):
+            return
+        help_text = (
+            "【検収ツールの概要】\n"
+            "\n"
+            "このツールは、患者情報・保険情報・公費情報について\n"
+            "『検収CSV』『一致のみリスト』『未ヒットリスト』『対象外リスト』を自動生成します。\n"
+            "\n"
+            "◆ 対象データ\n"
+            "・患者情報：患者番号で突合\n"
+            "・保険情報：患者番号＋保険者番号で突合\n"
+            "・公費情報：患者番号＋公費負担者番号で突合\n"
+            "\n"
+            "◆ 出力（各フォルダに保存）\n"
+            "1) 検収CSV（フォーマット済み）\n"
+            "2) 一致のみリスト（移行データと完全一致したもの）\n"
+            "3) 未ヒットリスト（元CSVにあるが移行データに存在しないもの）\n"
+            "4) 対象外リスト（移行対象外ルールに該当するもの）\n"
+            "\n"
+            "◆ 主な対象外ルール（抜粋）\n"
+            "・患者：患者番号空欄、氏名＋カナ空欄、カナ記号のみ、生年月日1900年未満、重複\n"
+            "・保険：保険者番号桁不正（6/8桁以外）、法別番号ルール違反、期限切れ、重複\n"
+            "・公費：負担者番号/受給者番号空欄、法別番号27/28、期限切れ、重複\n"
+            "\n"
+            "◆ 検収合格の目安\n"
+            "・『一致＋未ヒット＋対象外＝元CSV件数』が成立\n"
+            "・他システムの件数＝一致のみ件数\n"
+            "・未ヒットと対象外が同数で、対象外には理由が付与されている\n"
+            "\n"
+            "◆ データ移行日\n"
+            "検収ページ右上の『データ移行日』は、保険/公費の期限切れ判定に共通で使用します。\n"
+            "例：2024-07-10, 2024/7/10, R6.7.10 などを入力可能です。\n"
+            "\n"
+            "※ 詳細ルールは運用に合わせて随時拡張可能です。\n"
+        )
+        try:
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("1.0", help_text)
+            self.log_text.see("end")
+        except Exception:
+            pass
 
     def _ask_inspection_colmap(self, src_df: pd.DataFrame, required_cols: list[str] | None = None):
         """
@@ -209,7 +299,7 @@ class DataSurveyApp(tk.Tk):
             return
 
         # 既存タブをクリア
-        for child in self.notebook.winfo_children():
+        for child in self.result_notebook.winfo_children():
             child.destroy()
 
         # ローディング表示
@@ -309,6 +399,19 @@ class DataSurveyApp(tk.Tk):
 
         return files_info
 
+    def _log(self, msg: str):
+        """検収ページのテキストに追記し、コンソールにも出す。"""
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{ts}] {msg}\n"
+            if self.log_text is not None:
+                self.log_text.insert("end", line)
+                self.log_text.see("end")
+            print(line, end="")
+        except Exception:
+            # ログは失敗しても致命的ではない
+            pass
+
     # === メインスレッドで列ダイアログを出すヘルパ ===
     def _ask_code_col_sync(self, filename: str, columns: list[str]) -> str | None:
         result = {"col": None}
@@ -326,8 +429,8 @@ class DataSurveyApp(tk.Tk):
         for idx, info in enumerate(files_info_sorted):
             df = info["df"]; code_col = info["code_col"]; name = info["name"]; sample_df = info["sample_df"]
 
-            tab = ttk.Frame(self.notebook)
-            self.notebook.add(tab, text=f"{idx+1}: {name}")
+            tab = ttk.Frame(self.result_notebook)
+            self.result_notebook.add(tab, text=f"{idx+1}: {name}")
 
             if "error" in info:
                 ttk.Label(tab, text=info["error"]).pack(anchor="w", padx=10, pady=10)
