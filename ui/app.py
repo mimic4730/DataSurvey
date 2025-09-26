@@ -81,7 +81,7 @@ class DataSurveyApp(tk.Tk):
         win.title("検収カラムの対応付け")
         win.transient(self)
         win.grab_set()
-        win.resizable(False, True)
+        win.resizable(True, True)
 
         container = ttk.Frame(win)
         container.pack(expand=True, fill="both")
@@ -156,7 +156,7 @@ class DataSurveyApp(tk.Tk):
         win.update_idletasks()
         px, py = self.winfo_rootx(), self.winfo_rooty()
         pw, ph = self.winfo_width(), self.winfo_height()
-        w, h = 640, min(600, 90 + 28 * len(required_cols))
+        w, h = 700, min(900, 120 + 32 * len(required_cols))
         x, y = px + (pw - w)//2, py + (ph - h)//2
         win.geometry(f"{w}x{h}+{x}+{y}")
 
