@@ -717,6 +717,16 @@ class InspectionActions:
             excluded_df = pd.DataFrame()
         self._log(f"[{key_mode}] 対象外算出: {len(excluded_df)}件")
 
+        # === 未ヒットから対象外を除外（重複計上防止） ===
+        try:
+            if isinstance(missing_df, pd.DataFrame) and not missing_df.empty and isinstance(excluded_df, pd.DataFrame) and not excluded_df.empty:
+                # missing_df / excluded_df はいずれも src 由来の index を保持している想定
+                before_cnt = len(missing_df)
+                missing_df = missing_df.loc[~missing_df.index.isin(excluded_df.index)].copy()
+                self._log(f"[{key_mode}] 未ヒット⇔対象外の重複を除外: {before_cnt} → {len(missing_df)}")
+        except Exception:
+            pass
+
         # === 一致のみ（out_df基準でフィルタ）
         filtered_out_df = pd.DataFrame()
         try:
@@ -762,14 +772,28 @@ class InspectionActions:
                             matched_mask2 = pd.Series([ks in matched_keys2 for ks in key_series2], index=out_df.index)
                             filtered_out_df = out_df.loc[matched_mask2].copy()
 
-                # 重複除去
+                # 重複除去（正規化キーで判定: 先頭0無視）
                 if not filtered_out_df.empty:
-                    if key_mode in ("insurance", "public"):
-                        dedup_cols = ["患者番号", out_sub_col]
-                        if all(c in filtered_out_df.columns for c in dedup_cols):
-                            filtered_out_df = filtered_out_df.drop_duplicates(subset=dedup_cols, keep="first")
-                    elif key_mode == "patient" and "患者番号" in filtered_out_df.columns:
-                        filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号"], keep="first")
+                    try:
+                        if key_mode in ("insurance", "public"):
+                            if out_sub_col in filtered_out_df.columns:
+                                pat_norm_l = self._normalize_codes(filtered_out_df["患者番号"].astype(str), width_pat, mode="lstrip")
+                                sub_norm_l = self._normalize_codes(filtered_out_df[out_sub_col].astype(str), width_sub, mode="lstrip")
+                                key_series = pd.Series(list(zip(pat_norm_l, sub_norm_l)), index=filtered_out_df.index)
+                                keep_mask = ~key_series.duplicated(keep="first")
+                                filtered_out_df = filtered_out_df.loc[keep_mask].copy()
+                        else:
+                            pat_norm_l = self._normalize_codes(filtered_out_df["患者番号"].astype(str), width_pat, mode="lstrip")
+                            keep_mask = ~pat_norm_l.duplicated(keep="first")
+                            filtered_out_df = filtered_out_df.loc[keep_mask].copy()
+                    except Exception:
+                        # フォールバック: 生列で重複除去
+                        if key_mode in ("insurance", "public"):
+                            dedup_cols = ["患者番号", out_sub_col]
+                            if all(c in filtered_out_df.columns for c in dedup_cols):
+                                filtered_out_df = filtered_out_df.drop_duplicates(subset=dedup_cols, keep="first")
+                        elif key_mode == "patient" and "患者番号" in filtered_out_df.columns:
+                            filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号"], keep="first")
         except Exception:
             filtered_out_df = pd.DataFrame()
         self._log(f"[{key_mode}] 一致のみ算出: {len(filtered_out_df)}件")
