@@ -42,9 +42,9 @@ class DataSurveyApp(tk.Tk):
         self.config(menu=menubar)
 
         inspection_menu = tk.Menu(menubar, tearoff=0)
-        inspection_menu.add_command(label="患者情報検収CSVを生成", command=self.actions.run_patient)
-        inspection_menu.add_command(label="保険情報検収CSVを生成", command=self.actions.run_insurance)
-        inspection_menu.add_command(label="公費情報検収CSVを生成", command=self.actions.run_public)
+        inspection_menu.add_command(label="患者情報検収CSVを生成", command=self._wrap_run_patient_generate)
+        inspection_menu.add_command(label="保険情報検収CSVを生成", command=self._wrap_run_insurance_generate)
+        inspection_menu.add_command(label="公費情報検収CSVを生成", command=self._wrap_run_public_generate)
         inspection_menu.add_separator()
         inspection_menu.add_command(label="未ヒット患者（検収元→検収用）をCSV出力", command=self.actions.run_missing)
         menubar.add_cascade(label="検収", menu=inspection_menu)
@@ -94,9 +94,34 @@ class DataSurveyApp(tk.Tk):
 
         btns = ttk.Frame(self.page_inspect)
         btns.pack(fill="x", padx=10, pady=(0,6))
-        ttk.Button(btns, text="検収CSV生成(患者)", command=self.actions.run_patient).pack(side="left", padx=(0,6))
-        ttk.Button(btns, text="検収CSV生成(保険)", command=self.actions.run_insurance).pack(side="left", padx=(0,6))
-        ttk.Button(btns, text="検収CSV生成(公費)", command=self.actions.run_public).pack(side="left")
+        ttk.Button(btns, text="検収CSV生成(患者)", command=self._wrap_run_patient_generate).pack(side="left", padx=(0,6))
+        ttk.Button(btns, text="検収CSV生成(保険)", command=self._wrap_run_insurance_generate).pack(side="left", padx=(0,6))
+        ttk.Button(btns, text="検収CSV生成(公費)", command=self._wrap_run_public_generate).pack(side="left")
+
+        # ▼ 内容検収ボタン群
+        content_btns = ttk.Frame(self.page_inspect)
+        content_btns.pack(fill="x", padx=10, pady=(0,10))
+        self.btn_patient_content = ttk.Button(
+            content_btns,
+            text="内容検収(患者)",
+            command=self.actions.run_patient_content_check,
+            state=tk.DISABLED
+        )
+        self.btn_patient_content.pack(side="left", padx=(0,6))
+        self.btn_insurance_content = ttk.Button(
+            content_btns,
+            text="内容検収(保険)",
+            command=self._run_insurance_content_check,
+            state=tk.DISABLED
+        )
+        self.btn_insurance_content.pack(side="left", padx=(0,6))
+        self.btn_public_content = ttk.Button(
+            content_btns,
+            text="内容検収(公費)",
+            command=self._run_public_content_check,
+            state=tk.DISABLED
+        )
+        self.btn_public_content.pack(side="left")
 
         # ログテキスト（積み上げ式）
         log_frame = ttk.LabelFrame(self.page_inspect, text="ログ")
@@ -155,7 +180,8 @@ class DataSurveyApp(tk.Tk):
         except Exception:
             pass
 
-    def _ask_inspection_colmap(self, src_df: pd.DataFrame, required_cols: list[str] | None = None):
+    def _ask_inspection_colmap(self, src_df: pd.DataFrame, required_cols: list[str] | None = None,
+        preset: dict[str, str] | None = None):
         """
         検収用の固定カラム（inspection.INSPECTION_COLUMNS）に対して、
         入力CSV(src_df)のカラムをユーザーに対応付けさせるモーダルダイアログ。
@@ -204,6 +230,13 @@ class DataSurveyApp(tk.Tk):
             cb = ttk.Combobox(inner, values=choices, state="readonly", width=40)
             # 既定値：同名列があれば自動選択
             if out_col in cols:
+                cb.set(out_col)
+            else:
+                cb.set("(空欄)")
+            # プリセットを設定
+            if preset and preset.get(out_col) in choices:
+                cb.set(preset[out_col])
+            elif out_col in cols:
                 cb.set(out_col)
             else:
                 cb.set("(空欄)")
@@ -260,7 +293,6 @@ class DataSurveyApp(tk.Tk):
             digits = re.sub(r"\D", "", str(x) if x is not None else "")
             return digits.zfill(width) if digits else ""
         return s.map(_norm)
-
 
     # === 上段患者コードコピー ===
     def _copy_top_codes(self, top_df: pd.DataFrame, code_col: str):
@@ -482,3 +514,48 @@ class DataSurveyApp(tk.Tk):
             if token in low:
                 return k
         return "unknown"
+
+    def _wrap_run_patient_generate(self):
+        try:
+            ok = self.actions.run_patient()
+        except Exception as e:
+            messagebox.showerror("エラー", f"患者情報の検収CSV生成でエラーが発生しました。\n{e}")
+            return
+        if ok and hasattr(self, 'btn_patient_content') and self.btn_patient_content:
+            self.btn_patient_content.configure(state=tk.NORMAL)
+
+    def _wrap_run_insurance_generate(self):
+        try:
+            ok = self.actions.run_insurance()
+        except Exception as e:
+            messagebox.showerror("エラー", f"保険情報の検収CSV生成でエラーが発生しました。\n{e}")
+            return
+        if ok and hasattr(self, 'btn_insurance_content') and self.btn_insurance_content:
+            self.btn_insurance_content.configure(state=tk.NORMAL)
+
+    def _wrap_run_public_generate(self):
+        try:
+            ok = self.actions.run_public()
+        except Exception as e:
+            messagebox.showerror("エラー", f"公費情報の検収CSV生成でエラーが発生しました。\n{e}")
+            return
+        if ok and hasattr(self, 'btn_public_content') and self.btn_public_content:
+            self.btn_public_content.configure(state=tk.NORMAL)
+
+    def _run_patient_content_check(self):
+        if hasattr(self.actions, 'run_patient_content_check'):
+            self.actions.run_patient_content_check()
+        else:
+            messagebox.showinfo("未実装", "患者の内容検収は未実装です。")
+
+    def _run_insurance_content_check(self):
+        if hasattr(self.actions, 'run_insurance_content_check'):
+            self.actions.run_insurance_content_check()
+        else:
+            messagebox.showinfo("未実装", "保険の内容検収は未実装です。")
+
+    def _run_public_content_check(self):
+        if hasattr(self.actions, 'run_public_content_check'):
+            self.actions.run_public_content_check()
+        else:
+            messagebox.showinfo("未実装", "公費の内容検収は未実装です。")

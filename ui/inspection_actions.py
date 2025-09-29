@@ -4,6 +4,7 @@ from tkinter import filedialog, messagebox
 from datetime import datetime as _dt
 import pandas as pd
 from pathlib import Path
+import json, os
 
 from core.io_utils import CsvLoader
 from core import inspection
@@ -11,6 +12,7 @@ from core import inspection
 
 class InspectionActions:
     """検収系のUIイベントを集約します。app（DataSurveyApp）に依存します。"""
+    COLMAP_FILE = Path.home() / ".datasurvey" / "colmaps.json"
 
     def __init__(self, app):
         self.app = app  # DataSurveyApp（_ask_inspection_colmap, _normalize_patient_number_for_match を利用）
@@ -19,6 +21,24 @@ class InspectionActions:
         self._logger = None
         self._migration_provider = None  # callable that returns raw user input for migration date
         self._migration_yyyymmdd: str | None = None  # cached normalized yyyymmdd (shared for 保険/公費)
+
+    # プリセット保存・ロード
+    def _load_colmaps(self) -> dict:
+        try:
+            if self.COLMAP_FILE.exists():
+                with open(self.COLMAP_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_colmaps(self, data: dict) -> None:
+        try:
+            self.COLMAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.COLMAP_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     # ▼ 追加: app から受け取ったロガーを保持
     def set_logger(self, logger_callable):
@@ -838,15 +858,19 @@ class InspectionActions:
         in_path = filedialog.askopenfilename(title="患者情報CSVを選択してください", filetypes=[("CSV files", "*.csv")])
         self._log(f"[患者] 入力CSV: {in_path}")
         if not in_path:
-            return
+            return False
         try:
             src = CsvLoader.read_csv_flex(in_path)
             out_dir = self._prepare_output_dir(in_path, "patient")
             self._log(f"[患者] 出力先ディレクトリ: {out_dir}")
             colmap = self.app._ask_inspection_colmap(src, required_cols=list(inspection.COLUMNS_PATIENT))
             if colmap is None:
-                return
+                return False
+            
             self._log(f"[患者] マッピング完了: {colmap}")
+            colmaps = self._load_colmaps()
+            colmaps["patient"] = colmap
+            self._save_colmaps(colmaps)
             cfg = inspection.InspectionConfig(patient_number_width=10)
             out_df = inspection.build_inspection_df(src, colmap, cfg, target_columns=inspection.COLUMNS_PATIENT)
 
@@ -859,8 +883,10 @@ class InspectionActions:
                 filetypes=[("CSV files", "*.csv")]
             )
             if not out_path:
-                return
+                return False
+            
             inspection.to_csv(out_df, out_path)
+            
             self._log(f"[患者] 検収CSV出力: {out_path} (行数 {len(out_df)})")
 
             summary = self._ask_and_save_missing_and_matched(
@@ -873,14 +899,17 @@ class InspectionActions:
                 "完了",
                 f"出力が完了しました。\n一致: {summary.get('matched_count', 0)} 件 / 未ヒット: {summary.get('missing_count', 0)} 件 / 対象外: {summary.get('excluded_count', 0)} 件"
             )
+            return True
         except Exception as e:
             messagebox.showerror("エラー", f"検収処理中に失敗しました。\n{e}")
+            return False
 
     def run_insurance(self):
         in_path = filedialog.askopenfilename(title="保険情報の入力CSVを選択してください", filetypes=[("CSV files", "*.csv")])
         self._log(f"[保険] 入力CSV: {in_path}")
         if not in_path:
-            return
+            return False
+
         try:
             src = CsvLoader.read_csv_flex(in_path)
             out_dir = self._prepare_output_dir(in_path, "insurance")
@@ -888,8 +917,12 @@ class InspectionActions:
             required_cols = list(inspection.COLUMNS_INSURANCE) + ["保険終了日"]
             colmap = self.app._ask_inspection_colmap(src, required_cols=required_cols)
             if colmap is None:
-                return
+                return False
+            
             self._log(f"[保険] マッピング完了: {colmap}")
+            colmaps = self._load_colmaps()
+            colmaps["insurance"] = colmap
+            self._save_colmaps(colmaps)
             mig = self._get_migration_date()
             self.insurance_migration_yyyymmdd = mig  # 後方互換
             self._log(f"[保険] 移行日: {mig}")
@@ -905,7 +938,8 @@ class InspectionActions:
                 filetypes=[("CSV files", "*.csv")]
             )
             if not out_path:
-                return
+                return False
+            
             inspection.to_csv(out_df, out_path)
             self._log(f"[保険] 検収CSV出力: {out_path} (行数 {len(out_df)})")
 
@@ -919,14 +953,16 @@ class InspectionActions:
                 "完了",
                 f"出力が完了しました。\n一致: {summary.get('matched_count', 0)} 件 / 未ヒット: {summary.get('missing_count', 0)} 件 / 対象外: {summary.get('excluded_count', 0)} 件"
             )
+            return True
         except Exception as e:
             messagebox.showerror("エラー", f"保険情報の検収処理に失敗しました。\n{e}")
+            return False
 
     def run_public(self):
         in_path = filedialog.askopenfilename(title="公費情報の入力CSVを選択してください", filetypes=[("CSV files", "*.csv")])
         self._log(f"[公費] 入力CSV: {in_path}")
         if not in_path:
-            return
+            return False
         try:
             src = CsvLoader.read_csv_flex(in_path)
             out_dir = self._prepare_output_dir(in_path, "public")
@@ -934,8 +970,11 @@ class InspectionActions:
             required_cols = list(inspection.COLUMNS_PUBLIC) + ["公費終了日１"]
             colmap = self.app._ask_inspection_colmap(src, required_cols=required_cols)
             if colmap is None:
-                return
+                return False
             self._log(f"[公費] マッピング完了: {colmap}")
+            colmaps = self._load_colmaps()
+            colmaps["public"] = colmap
+            self._save_colmaps(colmaps)
             # 共通の移行日（検収ページ右上の入力欄から取得／キャッシュ）
             mig = self._get_migration_date()
             self.public_migration_yyyymmdd = mig  # 後方互換
@@ -952,7 +991,8 @@ class InspectionActions:
                 filetypes=[("CSV files", "*.csv")]
             )
             if not out_path:
-                return
+                return False
+        
             inspection.to_csv(out_df, out_path)
             self._log(f"[公費] 検収CSV出力: {out_path} (行数 {len(out_df)})")
 
@@ -966,8 +1006,10 @@ class InspectionActions:
                 "完了",
                 f"出力が完了しました。\n一致: {summary.get('matched_count', 0)} 件 / 未ヒット: {summary.get('missing_count', 0)} 件 / 対象外: {summary.get('excluded_count', 0)} 件"
             )
+            return True
         except Exception as e:
             messagebox.showerror("エラー", f"公費情報の検収処理に失敗しました。\n{e}")
+            return False
 
     def run_missing(self):
         # 単発の未ヒット抽出（元CSV vs 検収CSV）
@@ -1033,4 +1075,136 @@ class InspectionActions:
             messagebox.showinfo("完了", f"未ヒット {len(missing_df)} 件を出力しました。\n{out_path}")
         except Exception as e:
             messagebox.showerror("エラー", f"未ヒットリストの保存に失敗しました。\n{e}")
+
+    def run_patient_content_check(self) -> bool:
+        """患者情報の内容検収を実行（patient_content_check.py を呼び出す）。"""
+        try:
+            # 遅延インポート（起動時の ImportError を回避）
+            from . import patient_content_check as _pcc
+        except Exception as e:
+            messagebox.showerror(
+                "エラー",
+                "患者情報の内容検収モジュール(ui/patient_content_check.py)の読み込みに失敗しました。\n"
+                f"{e}\n\nファイル名・配置パスを確認してください。"
+            )
+            return False
+
+        # 実行関数を候補名から解決
+        func = None
+        for name in ("run_patient_content_check", "run", "main"):
+            f = getattr(_pcc, name, None)
+            if callable(f):
+                func = f
+                break
+
+        if func is None:
+            messagebox.showerror(
+                "エラー",
+                "ui/patient_content_check.py に実行関数が見つかりません。\n"
+                "次のいずれかの関数名で定義してください: run_patient_content_check / run / main"
+            )
+            return False
+
+        try:
+            maps = self._load_colmaps()
+            preset = maps.get("patient")
+            try:
+                # 関数シグネチャに 'logger' 引数があるか簡易判定
+                import inspect
+                sig = inspect.signature(func)
+                kwargs = {}
+                if 'logger' in sig.parameters:
+                    kwargs['logger'] = self._logger
+                if 'preset' in sig.parameters:
+                    kwargs['preset'] = preset
+                ok = func(self.app, **kwargs) if kwargs else func(self.app)
+            except Exception:
+                # シグネチャ取得に失敗した場合は素直に2引数トライ→1引数トライ
+                try:
+                    ok = func(self.app, logger=self._logger, preset=preset)
+                except Exception:
+                    ok = func(self.app)
+            return bool(ok)
+        except Exception as e:
+            messagebox.showerror("エラー", f"患者情報の内容検収でエラーが発生しました。\n{e}")
+            return False
+
+    def run_insurance_content_check(self) -> bool:
+        try:
+            # 遅延インポート
+            from . import insurance_content_check as _icc
+        except Exception as e:
+            messagebox.showerror("エラー", f"保険情報の内容検収モジュールの読み込みに失敗しました。\n{e}")
+            return False
+
+        # 実行関数を解決
+        func = None
+        for name in ("run_insurance_content_check", "run", "main"):
+            f = getattr(_icc, name, None)
+            if callable(f):
+                func = f; break
+        if func is None:
+            messagebox.showerror("エラー", "ui/insurance_content_check.py に実行関数が見つかりません。")
+            return False
+
+        # マッピングのプリセットをロード
+        maps = self._load_colmaps()
+        preset = maps.get("insurance")
+
+        # 検収ページの移行日（共通入力）を取得
+        mig = None
+        try:
+            mig = self._get_migration_date()  # 既存の共通関数（yyyymmdd を返す実装ならそのまま）
+        except Exception:
+            mig = None
+
+        # 呼び出し（logger/preset/migration_date を渡す）
+        try:
+            return bool(func(self.app, logger=self._logger, preset=preset, migration_date=mig))
+        except TypeError:
+            # 旧シグネチャ互換
+            return bool(func(self.app, logger=self._logger, preset=preset))
+
+    def run_public_content_check(self) -> bool:
+        """公費情報の内容検収を実行（public_content_check.py を呼び出す）。"""
+        try:
+            # 遅延インポート
+            from . import public_content_check as _pcc
+        except Exception as e:
+            messagebox.showerror("エラー", f"公費情報の内容検収モジュールの読み込みに失敗しました。\n{e}")
+            return False
+
+        # 実行関数を解決（run_public_content_check / run / main の順で探す）
+        func = None
+        for name in ("run_public_content_check", "run", "main"):
+            f = getattr(_pcc, name, None)
+            if callable(f):
+                func = f
+                break
+        if func is None:
+            messagebox.showerror("エラー", "ui/public_content_check.py に実行関数が見つかりません。")
+            return False
+
+        # マッピングのプリセットをロード
+        maps = self._load_colmaps()
+        preset = maps.get("public")
+
+        # 検収ページの移行日（共通入力）を取得（ファイル側が受け取らない実装でも後方互換で呼び出し可）
+        mig = None
+        try:
+            mig = self._get_migration_date()
+        except Exception:
+            mig = None
+
+        # 呼び出し（logger / preset / migration_date を可能なら渡す）
+        try:
+            return bool(func(self.app, logger=self._logger, preset=preset, migration_date=mig))
+        except TypeError:
+            # migration_date を受け取らない旧シグネチャ互換
+            try:
+                return bool(func(self.app, logger=self._logger, preset=preset))
+            except TypeError:
+                # logger/preset も受け取らない場合
+                return bool(func(self.app))
+
 
