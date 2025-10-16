@@ -1011,6 +1011,19 @@ class InspectionActions:
             messagebox.showerror("エラー", f"公費情報の検収処理に失敗しました。\n{e}")
             return False
 
+    def run_ceiling(self):
+        in_path = filedialog.askopenfilename(title="限度額情報CSVを選択してください", filetypes=[("CSV files", "*.csv")])
+        self._log(f"[限度額] 入力CSV: {in_path}")
+        if not in_path:
+            return False
+        try:
+            # ここではまず器だけ用意（後で COLUMNS_CEILING 等に差し替え）
+            messagebox.showinfo("準備中", "限度額の検収CSV生成は現在実装中です。次のステップでロジックを追加します。")
+            return False  # 生成未完了のため内容検収ボタンはまだ有効化しない
+        except Exception as e:
+            messagebox.showerror("エラー", f"限度額情報の検収処理に失敗しました。\n{e}")
+            return False
+
     def run_missing(self):
         # 単発の未ヒット抽出（元CSV vs 検収CSV）
         src_path = filedialog.askopenfilename(title="検収元（無加工）CSVを選択してください", filetypes=[("CSV files", "*.csv")])
@@ -1207,4 +1220,6 @@ class InspectionActions:
                 # logger/preset も受け取らない場合
                 return bool(func(self.app))
 
-
+    def run_ceiling_content_check(self) -> bool:
+        messagebox.showinfo("未実装", "限度額の内容検収は現在未実装です。生成ロジックと併せて順次対応します。")
+        return False

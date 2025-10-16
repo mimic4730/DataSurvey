@@ -45,6 +45,7 @@ class DataSurveyApp(tk.Tk):
         inspection_menu.add_command(label="患者情報検収CSVを生成", command=self._wrap_run_patient_generate)
         inspection_menu.add_command(label="保険情報検収CSVを生成", command=self._wrap_run_insurance_generate)
         inspection_menu.add_command(label="公費情報検収CSVを生成", command=self._wrap_run_public_generate)
+        inspection_menu.add_command(label="限度額情報検収CSVを生成",command=self._wrap_run_ceiling_generate)
         inspection_menu.add_separator()
         inspection_menu.add_command(label="未ヒット患者（検収元→検収用）をCSV出力", command=self.actions.run_missing)
         menubar.add_cascade(label="検収", menu=inspection_menu)
@@ -97,6 +98,7 @@ class DataSurveyApp(tk.Tk):
         ttk.Button(btns, text="検収CSV生成(患者)", command=self._wrap_run_patient_generate).pack(side="left", padx=(0,6))
         ttk.Button(btns, text="検収CSV生成(保険)", command=self._wrap_run_insurance_generate).pack(side="left", padx=(0,6))
         ttk.Button(btns, text="検収CSV生成(公費)", command=self._wrap_run_public_generate).pack(side="left")
+        ttk.Button(btns, text="検収CSV生成(限度額)", command=self._wrap_run_ceiling_generate).pack(side="left")
 
         # ▼ 内容検収ボタン群
         content_btns = ttk.Frame(self.page_inspect)
@@ -104,7 +106,7 @@ class DataSurveyApp(tk.Tk):
         self.btn_patient_content = ttk.Button(
             content_btns,
             text="内容検収(患者)",
-            command=self.actions.run_patient_content_check,
+            command=self._run_patient_content_check,
             state=tk.DISABLED
         )
         self.btn_patient_content.pack(side="left", padx=(0,6))
@@ -122,6 +124,13 @@ class DataSurveyApp(tk.Tk):
             state=tk.DISABLED
         )
         self.btn_public_content.pack(side="left")
+        self.btn_ceiling_content = ttk.Button(
+            content_btns,
+            text="内容検収(限度額)",
+            command=self._run_ceiling_content_check,
+            state=tk.DISABLED
+        )
+        self.btn_ceiling_content.pack(side="left", padx=(0,6))
 
         # ログテキスト（積み上げ式）
         log_frame = ttk.LabelFrame(self.page_inspect, text="ログ")
@@ -542,20 +551,41 @@ class DataSurveyApp(tk.Tk):
         if ok and hasattr(self, 'btn_public_content') and self.btn_public_content:
             self.btn_public_content.configure(state=tk.NORMAL)
 
+    def _wrap_run_ceiling_generate(self):
+        try:
+            ok = self.actions.run_ceiling()
+        except Exception as e:
+            messagebox.showerror("エラー", f"限度額情報の検収CSV生成でエラーが発生しました。\n{e}")
+            return
+        if ok and hasattr(self, 'btn_ceiling_content') and self.btn_ceiling_content:
+            self.btn_ceiling_content.configure(state=tk.NORMAL)
+
     def _run_patient_content_check(self):
-        if hasattr(self.actions, 'run_patient_content_check'):
+        try:
             self.actions.run_patient_content_check()
-        else:
-            messagebox.showinfo("未実装", "患者の内容検収は未実装です。")
+        except AttributeError:
+            messagebox.showerror("エラー", "run_patient_content_check が見つかりません。inspection_actions.py を確認してください。")
+        except Exception as e:
+            messagebox.showerror("エラー", f"患者の内容検収でエラーが発生しました。\n{e}")
 
     def _run_insurance_content_check(self):
-        if hasattr(self.actions, 'run_insurance_content_check'):
+        try:
             self.actions.run_insurance_content_check()
-        else:
-            messagebox.showinfo("未実装", "保険の内容検収は未実装です。")
+        except AttributeError:
+            messagebox.showerror("エラー", "run_insurance_content_check が見つかりません。inspection_actions.py を確認してください。")
+        except Exception as e:
+            messagebox.showerror("エラー", f"保険の内容検収でエラーが発生しました。\n{e}")
 
     def _run_public_content_check(self):
-        if hasattr(self.actions, 'run_public_content_check'):
+        try:
             self.actions.run_public_content_check()
+        except AttributeError:
+            messagebox.showerror("エラー", "run_public_content_check が見つかりません。inspection_actions.py を確認してください。")
+        except Exception as e:
+            messagebox.showerror("エラー", f"公費の内容検収でエラーが発生しました。\n{e}")
+
+    def _run_ceiling_content_check(self):
+        if hasattr(self.actions, 'run_ceiling_content_check'):
+            self.actions.run_ceiling_content_check()
         else:
-            messagebox.showinfo("未実装", "公費の内容検収は未実装です。")
+            messagebox.showinfo("未実装", "限度額の内容検収は未実装です。")
