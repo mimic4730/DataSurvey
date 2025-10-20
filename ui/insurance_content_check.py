@@ -6,6 +6,9 @@ import pandas as pd
 from datetime import datetime as _dt
 import threading
 
+import numpy as np
+from pandas.util import hash_pandas_object
+
 from core.io_utils import CsvLoader
 from core import inspection
 
@@ -116,6 +119,14 @@ class InsuranceContentChecker:
         # 文字列連結（ベクトル化）。`+` は Cython 実装で高速。
         return a + "|" + b
 
+    def _make_hash_key(self, pat: pd.Series, payer: pd.Series) -> pd.Series:
+        """患者番号+保険者番号から 64bit ハッシュキーを生成（高速join/差集合向け）。
+        事前に正規化済みの Series を渡すこと。
+        """
+        df = pd.DataFrame({'a': pat.fillna('').astype(str), 'b': payer.fillna('').astype(str)})
+        # uint64 のまま扱う（object ではなく数値キーなのでメモリ/速度に有利）
+        return hash_pandas_object(df, index=False, categorize=False).astype('uint64')
+
     # ---- Main ----
     def _process(self, app, src: pd.DataFrame, cmp_df: pd.DataFrame, colmap: dict, out_dir: Path, width: int, mig: str | None):
         """重い本処理。バックグラウンドスレッドで実行し、UI更新は after で行う。
@@ -178,43 +189,52 @@ class InsuranceContentChecker:
             cmp_norm = cmp_norm.drop_duplicates(subset=dup_subset, keep="first")
             self._ui_log(app, f"[保険-内容] 完全重複の除去 完了: src={len(src_norm)} cmp={len(cmp_norm)}")
 
-            # 4) キー生成（ベクトル化文字列連結）
+            # 4) キー生成（64bitハッシュ）
             src_norm = src_norm[(src_norm["患者番号"] != "") & (src_norm["保険者番号"] != "")].copy()
             cmp_norm = cmp_norm[(cmp_norm["患者番号"] != "") & (cmp_norm["保険者番号"] != "")].copy()
-            src_norm["__key__"] = self._make_key_series(src_norm["患者番号"], src_norm["保険者番号"])
-            cmp_norm["__key__"] = self._make_key_series(cmp_norm["患者番号"], cmp_norm["保険者番号"])
+            src_norm["__hkey__"] = self._make_hash_key(src_norm["患者番号"], src_norm["保険者番号"]).to_numpy()
+            cmp_norm["__hkey__"] = self._make_hash_key(cmp_norm["患者番号"], cmp_norm["保険者番号"]).to_numpy()
 
-            # 5) 未ヒット（anti-join）: set で membership を取り、高速化
+            # 5) 未ヒット（anti-join）：Index 差集合で高速化
             self._ui_log(app, "[保険-内容] 未ヒット(anti-join) 算出中")
-            cmp_key_set = set(cmp_norm["__key__"].tolist())
-            missing_mask = ~src_norm["__key__"].isin(cmp_key_set)
-            # 元の行を抽出（インデックス対応のために src の直値を参照）
-            missing_df = src.loc[src_norm.index[missing_mask]].copy()
+            src_keys = pd.Index(src_norm["__hkey__"], dtype="uint64")
+            cmp_keys = pd.Index(cmp_norm["__hkey__"], dtype="uint64")
+            missing_keys = src_keys.difference(cmp_keys)
+            missing_mask = src_keys.isin(missing_keys)
+            missing_idx = src_norm.index[missing_mask]
+            missing_df = src.loc[missing_idx].copy()
             if not missing_df.empty:
-                missing_df.insert(0, "__正規化保険者番号__", src_norm.loc[missing_df.index, "保険者番号"].values)
-                missing_df.insert(0, "__正規化患者番号__", src_norm.loc[missing_df.index, "患者番号"].values)
+                missing_df.insert(0, "__正規化保険者番号__", src_norm.loc[missing_idx, "保険者番号"].values)
+                missing_df.insert(0, "__正規化患者番号__", src_norm.loc[missing_idx, "患者番号"].values)
             self._ui_log(app, f"[保険-内容] 未ヒット(anti-join) 完了: {len(missing_df)}件")
 
-            # 6) 一致/不一致：Index join による内部結合
+            # 6) 一致/不一致：ハッシュキーで内部結合
             self._ui_log(app, "[保険-内容] 一致/不一致 join 中")
-            src_idx = src_norm.set_index("__key__", drop=False)
-            cmp_idx = cmp_norm.set_index("__key__", drop=False)
-            merged = src_idx.join(cmp_idx, how="inner", lsuffix="_src", rsuffix="_cmp", sort=False)
+            merged = src_norm.merge(
+                cmp_norm,
+                on="__hkey__",
+                how="inner",
+                suffixes=("_src", "_cmp"),
+                copy=False,
+                sort=False,
+            )
             self._ui_log(app, f"[保険-内容] 一致/不一致 join 完了: merged={len(merged)}行")
 
             fields = ["患者負担割合", "保険開始日", "保険終了日", "保険証記号", "保険証番号"]
-            # 完全一致判定
-            all_eq_mask = pd.Series(True, index=merged.index)
-            for f in fields:
-                all_eq_mask &= (merged[f + "_src"] == merged[f + "_cmp"])
+            # 完全一致判定（NumPyで一括比較）
+            bools = [ (merged[f+"_src"].to_numpy() == merged[f+"_cmp"].to_numpy()) for f in fields ]
+            if bools:
+                all_eq_mask = np.logical_and.reduce(bools)
+            else:
+                all_eq_mask = np.array([], dtype=bool)
 
             # 一致行の抽出
-            matched_cols = ["患者番号_src", "保険者番号_src"] + [f + "_src" for f in fields]
+            matched_cols = ["患者番号_src", "保険者番号_src"] + [f+"_src" for f in fields]
             matched_rows = merged.loc[all_eq_mask, matched_cols].copy()
             matched_rows.rename(columns={
                 "患者番号_src": "患者番号",
                 "保険者番号_src": "保険者番号",
-                **{f + "_src": f for f in fields}
+                **{f+"_src": f for f in fields}
             }, inplace=True)
 
             # 不一致明細
@@ -245,8 +265,8 @@ class InsuranceContentChecker:
             inspection.to_csv(missing_df, str(out_missing))
             self._ui_log(app, "[保険-内容] 出力完了")
 
-            # 8) メモリ回収（次タスクが続く場合の安定性向上）
-            del cmp_key_set, src_idx, cmp_idx, merged
+            # 8) メモリ回収
+            del src_keys, cmp_keys, missing_keys, merged
             gc.collect()
 
             def _notify_ok():

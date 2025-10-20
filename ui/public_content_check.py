@@ -17,9 +17,10 @@ class PublicContentChecker:
     キー = (患者番号, 公費負担者番号) で突合し、以下の項目の一致/不一致を判定。
       * 公費受給者番号
       * 公費開始日
+      * 公費終了日（元CSV側が空欄でなければ比較に含める）
     対象スロット: 1 / 2 を縦持ち展開して比較。
 
-    ・開始日が「移行日」より未来（超未来）の場合は、移行日に置換して比較。
+    ・終了日が移行日より前は「期限切れ」として対象外（共通ルール）。
     ・患者番号は両CSVから桁幅を推定して0埋め統一。
     ・負担者/受給者番号は数字だけ比較（桁の0埋め差は吸収）。
     """
@@ -63,16 +64,26 @@ class PublicContentChecker:
 
     @staticmethod
     def _min_with_cap_to_migration(date_yyyymmdd: str | None, migration_yyyymmdd: str | None) -> str:
+        """\
+        開始日の丸め規則：
+          - migration_yyyymmdd が無い場合はそのまま返す
+          - date_yyyymmdd が空欄 → 移行日が属する月の1日(YYYYMM01) を返す
+          - date_yyyymmdd が移行日より未来 → 移行日を返す
+          - それ以外 → date_yyyymmdd を返す
+        前提：date_yyyymmdd/migration_yyyymmdd はともに 'YYYYMMDD' 形式（呼び出し側で正規化）
+        """
         if not migration_yyyymmdd:
             return date_yyyymmdd or ""
-        # 空欄なら移行日に補完
-        if not date_yyyymmdd:
-            return migration_yyyymmdd
-        # 未来日は移行日に丸める
         try:
+            # 空欄は移行月初（YYYYMM01）で補完
+            if not date_yyyymmdd:
+                mig_month_first = migration_yyyymmdd[:6] + "01"
+                return mig_month_first
+            # 未来日は移行日に丸める
             return migration_yyyymmdd if date_yyyymmdd > migration_yyyymmdd else date_yyyymmdd
         except Exception:
-            return date_yyyymmdd
+            # 何かあれば元値を返す
+            return date_yyyymmdd or ""
 
     # ---------- reshape helpers ----------
     def _unpivot_public_slots(self, df: pd.DataFrame, mapping: dict[str, str], slot: int) -> pd.DataFrame:
@@ -82,12 +93,14 @@ class PublicContentChecker:
          - f"公費負担者番号{slot}"
          - f"公費受給者番号{slot}"
          - f"公費開始日{slot}"
+         - f"公費終了日{slot}"
         （不足時は空欄列で補う）
         """
         pat_col = mapping.get("患者番号")
         payer_col = mapping.get(f"公費負担者番号{slot}")
         recip_col = mapping.get(f"公費受給者番号{slot}")
         start_col = mapping.get(f"公費開始日{slot}")
+        end_col = mapping.get(f"公費終了日{slot}")
 
         def _col_or_empty(colname: str) -> pd.Series:
             return df[colname] if colname and colname in df.columns else pd.Series([""] * len(df), index=df.index, dtype="object")
@@ -97,6 +110,7 @@ class PublicContentChecker:
             "公費負担者番号": _col_or_empty(payer_col),
             "公費受給者番号": _col_or_empty(recip_col),
             "公費開始日": _col_or_empty(start_col),
+            "公費終了日": _col_or_empty(end_col),
         }, index=df.index)
         return out
 
@@ -110,9 +124,11 @@ class PublicContentChecker:
             "公費負担者番号1": ["公費負担者番号1", "第一公費負担者番号", "第一公費番号", "公費負担者番号１"],
             "公費受給者番号1": ["公費受給者番号1", "第一公費受給者番号", "公費受給者番号１"],
             "公費開始日1": ["公費開始日1", "第一公費開始日", "公費開始日１"],
+            "公費終了日1": ["公費終了日1", "第一公費終了日", "公費終了日１"],
             "公費負担者番号2": ["公費負担者番号2", "第2公費負担者番号", "第二公費負担者番号", "第２公費負担者番号", "公費負担者番号２"],
             "公費受給者番号2": ["公費受給者番号2", "第2公費受給者番号", "第二公費受給者番号", "第２公費受給者番号", "公費受給者番号２"],
             "公費開始日2": ["公費開始日2", "第2公費開始日", "第二公費開始日", "第２公費開始日", "公費開始日２"],
+            "公費終了日2": ["公費終了日2", "第2公費終了日", "第二公費終了日", "第２公費終了日", "公費終了日２"],
         }
 
         def pick(cols: list[str]) -> str | None:
@@ -126,9 +142,11 @@ class PublicContentChecker:
             "公費負担者番号1": pick(aliases["公費負担者番号1"]),
             "公費受給者番号1": pick(aliases["公費受給者番号1"]),
             "公費開始日1": pick(aliases["公費開始日1"]),
+            "公費終了日1": pick(aliases["公費終了日1"]),
             "公費負担者番号2": pick(aliases["公費負担者番号2"]),
             "公費受給者番号2": pick(aliases["公費受給者番号2"]),
             "公費開始日2": pick(aliases["公費開始日2"]),
+            "公費終了日2": pick(aliases["公費終了日2"]),
         }
 
     # ---------- main ----------
@@ -142,8 +160,11 @@ class PublicContentChecker:
         out_dir = self._prepare_output_dir(in_path, "公費")
 
         # 2) マッピング（プリセット適用）— 元CSV側
-        required_src = ["患者番号", "公費負担者番号１", "公費受給者番号１", "公費開始日１",
-                        "公費負担者番号２", "公費受給者番号２", "公費開始日２"]
+        required_src = [
+            "患者番号",
+            "公費負担者番号１", "公費受給者番号１", "公費開始日１", "公費終了日１",
+            "公費負担者番号２", "公費受給者番号２", "公費開始日２", "公費終了日２",
+        ]
         # UIのラベルは全角1/2のことがあるので内部キーは 1/2 で扱う
         # app 側のダイアログは required_cols の表記に従うため、ここではそのまま要求
         colmap_src = app._ask_inspection_colmap(src, required_cols=required_src, preset=self._preset)
@@ -187,7 +208,7 @@ class PublicContentChecker:
                 mig = None
         if mig:
             mig = inspection._parse_date_any_to_yyyymmdd(mig) or None
-        self.log(f"[公費-内容] 比較用の移行日(未来開始日の置換基準): {mig or '(未設定)'}")
+        self.log(f"[公費-内容] 比較用の移行日: {mig or '(未設定)'} / ルール: 未来日の丸めは行わず、終了日は元が非空のときのみ比較")
 
         # UIの required_src は全角の “１/２” だが、内部処理のスロット番号は 1/2 に合わせる
         # 一旦、処理用にマップし直す
@@ -198,9 +219,11 @@ class PublicContentChecker:
                 "公費負担者番号１": "公費負担者番号1",
                 "公費受給者番号１": "公費受給者番号1",
                 "公費開始日１": "公費開始日1",
+                "公費終了日１": "公費終了日1",
                 "公費負担者番号２": "公費負担者番号2",
                 "公費受給者番号２": "公費受給者番号2",
                 "公費開始日２": "公費開始日2",
+                "公費終了日２": "公費終了日2",
             }
             for k_j, k_h in repl.items():
                 if k_j in m and k_h not in m:
@@ -212,22 +235,54 @@ class PublicContentChecker:
         src_1 = self._unpivot_public_slots(src, {"患者番号": src_map_proc.get("患者番号"),
                                                  "公費負担者番号1": src_map_proc.get("公費負担者番号1"),
                                                  "公費受給者番号1": src_map_proc.get("公費受給者番号1"),
-                                                 "公費開始日1": src_map_proc.get("公費開始日1")}, slot=1)
+                                                 "公費開始日1": src_map_proc.get("公費開始日1"),
+                                                 "公費終了日1": src_map_proc.get("公費終了日1")}, slot=1)
         src_2 = self._unpivot_public_slots(src, {"患者番号": src_map_proc.get("患者番号"),
                                                  "公費負担者番号2": src_map_proc.get("公費負担者番号2"),
                                                  "公費受給者番号2": src_map_proc.get("公費受給者番号2"),
-                                                 "公費開始日2": src_map_proc.get("公費開始日2")}, slot=2)
+                                                 "公費開始日2": src_map_proc.get("公費開始日2"),
+                                                 "公費終了日2": src_map_proc.get("公費終了日2")}, slot=2)
         src_long = pd.concat([src_1, src_2], axis=0, ignore_index=True)
 
         src_long["患者番号"] = self._normalize_codes(src_long["患者番号"], width, mode="zfill")
         src_long["公費負担者番号"] = self._digits_only_series(src_long["公費負担者番号"])
         src_long["公費受給者番号"] = self._digits_only_series(src_long["公費受給者番号"])
         src_long["公費開始日"] = self._date_norm_series(src_long["公費開始日"])
-        if mig:
-            src_long["公費開始日"] = src_long["公費開始日"].map(lambda v, m=mig: self._min_with_cap_to_migration(v, m))
+        src_long["公費終了日"] = self._date_norm_series(src_long["公費終了日"])
+        
+        mig = self._migration_yyyymmdd
+        if not mig and hasattr(getattr(app, "actions", None), "_get_migration_date"):
+            try:
+                mig = app.actions._get_migration_date()
+            except Exception:
+                mig = None
+        mig = inspection._parse_date_any_to_yyyymmdd(mig) or None
 
-        # 空負担者は無効行として落とす（比較対象外）
-        src_long = src_long[(src_long["患者番号"] != "") & (src_long["公費負担者番号"] != "")].copy()
+        if mig:
+            mig_month_first = mig[:6] + "01"
+            src_long["公費開始日"] = src_long["公費開始日"].map(lambda v: mig_month_first if (str(v) == "") else v)
+    
+        # === 対象外（共通ルールへ委譲：期限切れ含む全ルールを一元判定） ===
+        from core.rules.public import evaluate_public_exclusions, PublicRuleConfig
+
+        # 公費共通ルールが期待する内部カラム名に合わせたマッピング
+        proc_colmap = {
+            "患者番号": "患者番号",
+            "公費負担者番号": "公費負担者番号",
+            "公費受給者番号": "公費受給者番号",
+            "公費開始日": "公費開始日",
+            "公費終了日": "公費終了日",
+        }
+        # 期限切れ（終了日 < 移行日）の扱いも含め、ここで一元的に除外を実施
+        cfg_rules = PublicRuleConfig(migration_yyyymmdd=mig)
+
+        try:
+            # src_long を共通ルールへ投入 → (残りデータ, 対象外) を受け取る
+            src_long, excluded_out = evaluate_public_exclusions(src_long, proc_colmap, cfg_rules)
+        except Exception as e:
+            # 失敗時はルールを適用せずに先へ進む（未ヒットに混入するのを防ぐためログだけ残す）
+            self.log(f"[公費-内容] 対象外ルール適用で例外: {e} / ルール未適用のまま続行します")
+            excluded_out = pd.DataFrame()
 
         # 6) 突合側 → 縦持ち & 正規化
         # cmp_map を内部キーへ変換
@@ -240,12 +295,14 @@ class PublicContentChecker:
             "公費負担者番号": _cmp_pick("公費負担者番号1"),
             "公費受給者番号": _cmp_pick("公費受給者番号1"),
             "公費開始日": _cmp_pick("公費開始日1"),
+            "公費終了日": _cmp_pick("公費終了日1"),
         })
         cmp_2 = pd.DataFrame({
             "患者番号": _cmp_pick("患者番号"),
             "公費負担者番号": _cmp_pick("公費負担者番号2"),
             "公費受給者番号": _cmp_pick("公費受給者番号2"),
             "公費開始日": _cmp_pick("公費開始日2"),
+            "公費終了日": _cmp_pick("公費終了日2"),
         })
         cmp_long = pd.concat([cmp_1, cmp_2], axis=0, ignore_index=True)
 
@@ -253,67 +310,106 @@ class PublicContentChecker:
         cmp_long["公費負担者番号"] = self._digits_only_series(cmp_long["公費負担者番号"])
         cmp_long["公費受給者番号"] = self._digits_only_series(cmp_long["公費受給者番号"])
         cmp_long["公費開始日"] = self._date_norm_series(cmp_long["公費開始日"])
-        if mig:
-            cmp_long["公費開始日"] = cmp_long["公費開始日"].map(lambda v, m=mig: self._min_with_cap_to_migration(v, m))
+        cmp_long["公費終了日"] = self._date_norm_series(cmp_long["公費終了日"])
 
         cmp_long = cmp_long[(cmp_long["患者番号"] != "") & (cmp_long["公費負担者番号"] != "")].copy()
 
         # 完全重複（キー＋比較対象列がすべて同じ）だけを事前に落として直積膨張を防ぐ
-        subset_cols = ["患者番号", "公費負担者番号", "公費受給者番号", "公費開始日"]
+        subset_cols = ["患者番号", "公費負担者番号", "公費受給者番号", "公費開始日", "公費終了日"]
         src_long = src_long.drop_duplicates(subset=subset_cols, keep="first")
         cmp_long = cmp_long.drop_duplicates(subset=subset_cols, keep="first")
 
         # 7) 未ヒット（元にあるが突合に無いキー）
-        cmp_key_set = set(zip(cmp_long["患者番号"], cmp_long["公費負担者番号"]))
-        src_keys = list(zip(src_long["患者番号"], src_long["公費負担者番号"]))
-        missing_mask = pd.Series([k not in cmp_key_set for k in src_keys], index=src_long.index)
-        missing_norm = src_long.loc[missing_mask].copy()
+        def _key_rows(df: pd.DataFrame, use_src_rule: bool) -> list[tuple]:
+            keys = []
+            for p, g, r, s, e in zip(
+                df["患者番号"],
+                df["公費負担者番号"],
+                df["公費受給者番号"],
+                df["公費開始日"],
+                df.get("公費終了日", pd.Series([""] * len(df)))
+            ):
+                e_norm = (e if str(e) != "" else None)
+                if use_src_rule:
+                    # 元CSV側: 終了日が非空ならキーに含める／空なら含めない
+                    k = (p, g, r, s, e_norm if e_norm else None)
+                else:
+                    # 突合側: 空欄は None に寄せる（src との比較用）
+                    k = (p, g, r, s, e_norm)
+                keys.append(k)
+            return keys
 
-        # 元CSVから元行を拾うため、キーで結び直し（可能なら）
-        # ここでは正規化値そのままを出力（どのレコードが落ちているか把握しやすい）
+        src_keys = _key_rows(src_long, use_src_rule=True)
+        cmp_keys = set(_key_rows(cmp_long, use_src_rule=False))
+        missing_mask = pd.Series([k not in cmp_keys for k in src_keys], index=src_long.index)
+        missing_norm = src_long.loc[missing_mask].copy()
         missing_out = missing_norm.copy()
         if not missing_out.empty:
             missing_out.insert(0, "__キー__", missing_out["患者番号"] + "-" + missing_out["公費負担者番号"])
 
+        # ---- 未ヒット中の「対象外」(期限切れ含む) を再評価して未ヒットから除外 ----
+        if not missing_out.empty and excluded_out is not None and not excluded_out.empty:
+            # すでに共通ルールで対象外に振り分けたキーは未ヒットから除外
+            ex_keys = set(zip(excluded_out["患者番号"], excluded_out["公費負担者番号"]))
+            _miss_keys = list(zip(missing_out["患者番号"], missing_out["公費負担者番号"]))
+            _mask_keep = pd.Series([k not in ex_keys for k in _miss_keys], index=missing_out.index)
+            missing_out = missing_out.loc[_mask_keep].copy()
+
         # 8) 一致/不一致
-        merged = src_long.merge(cmp_long, on=["患者番号", "公費負担者番号"], how="inner", suffixes=("_src", "_cmp"))
-        fields = ["公費受給者番号", "公費開始日"]
-
-        all_eq = pd.Series([True] * len(merged), index=merged.index)
-        for f in fields:
-            all_eq &= (merged[f + "_src"] == merged[f + "_cmp"])
-
-        matched_rows = merged.loc[all_eq, ["患者番号", "公費負担者番号"] + [f + "_src" for f in fields]].copy()
-        matched_rows.rename(columns={f + "_src": f for f in fields}, inplace=True)
-
-        mismatches = []
-        for f in fields:
-            neq = merged.loc[merged[f + "_src"] != merged[f + "_cmp"], ["患者番号", "公費負担者番号", f + "_src", f + "_cmp"]].copy()
-            if not neq.empty:
-                neq.insert(2, "項目名", f)
-                neq.rename(columns={f + "_src": "正規化_元", f + "_cmp": "正規化_突合"}, inplace=True)
-                mismatches.append(neq)
-        mismatch_df = pd.concat(mismatches, axis=0) if mismatches else pd.DataFrame(
-            columns=["患者番号", "公費負担者番号", "項目名", "正規化_元", "正規化_突合"]
+        merged = src_long.merge(
+            cmp_long,
+            on=["患者番号", "公費負担者番号", "公費受給者番号", "公費開始日"],
+            how="inner",
+            suffixes=("_src", "_cmp")
         )
+
+        # 一致: src側の終了日が空欄 もしくは 完全一致
+        src_end = merged["公費終了日_src"].fillna("")
+        cmp_end = merged["公費終了日_cmp"].fillna("")
+        eq_end = (src_end == "") | (src_end == cmp_end)
+
+        matched_rows = merged.loc[eq_end, [
+            "患者番号", "公費負担者番号", "公費受給者番号", "公費開始日", "公費終了日_src"
+        ]].copy()
+        matched_rows.rename(columns={"公費終了日_src": "公費終了日"}, inplace=True)
+
+        # 終了日不一致のみを不一致として出す
+        mismatch_df = merged.loc[~eq_end, [
+            "患者番号", "公費負担者番号", "公費受給者番号",
+            "公費開始日", "公費終了日_src", "公費終了日_cmp"
+        ]].copy()
+        if not mismatch_df.empty:
+            mismatch_df.insert(2, "項目名", "公費終了日")
+            mismatch_df.rename(columns={
+                "公費終了日_src": "正規化_元",
+                "公費終了日_cmp": "正規化_突合"
+            }, inplace=True)
+        else:
+            mismatch_df = pd.DataFrame(columns=["患者番号","公費負担者番号","項目名","正規化_元","公費受給者番号","公費開始日","正規化_突合"])  # schema safeguard
 
         # 9) 出力
         tag = _dt.now().strftime("%Y%m%d")
         out_matched  = out_dir / f"公費_内容_一致_{tag}.csv"
         out_mismatch = out_dir / f"公費_内容_不一致_{tag}.csv"
         out_missing  = out_dir / f"公費_内容_未ヒット_{tag}.csv"
+        out_excluded = out_dir / f"公費_内容_対象外_{tag}.csv"
+        if 'excluded_out' in locals():
+            inspection.to_csv(excluded_out, str(out_excluded))
+        else:
+            excluded_out = pd.DataFrame()
 
         inspection.to_csv(matched_rows, str(out_matched))
         inspection.to_csv(mismatch_df, str(out_mismatch))
         inspection.to_csv(missing_out, str(out_missing))
 
+        _excluded_len = len(excluded_out) if excluded_out is not None else 0
         self.log(
-            f"[公費-内容] 一致: {len(matched_rows)} / 不一致明細行: {len(mismatch_df)} / 未ヒット: {len(missing_out)}\n"
-            f"  (src={len(src_long)}, cmp={len(cmp_long)})"
+            f"[公費-内容] 一致: {len(matched_rows)} / 不一致明細行: {len(mismatch_df)} / 未ヒット: {len(missing_out)} / 対象外: {_excluded_len}"
+            f"\n  (src={len(src_long)+_excluded_len}, cmp={len(cmp_long)})"
         )
         messagebox.showinfo(
             "公費内容検収 完了",
-            f"一致: {len(matched_rows)} 件\n不一致明細: {len(mismatch_df)} 行（項目単位）\n未ヒット: {len(missing_out)} 件\n\n出力先:\n{out_dir}"
+            f"一致: {len(matched_rows)} 件\n不一致明細: {len(mismatch_df)} 行（項目単位）\n未ヒット: {len(missing_out)} 件\n対象外: {_excluded_len} 件（これらは比較から除外されました）\n\n出力先:\n{out_dir}"
         )
         return True
 
