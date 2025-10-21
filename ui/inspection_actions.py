@@ -261,84 +261,24 @@ class InspectionActions:
             reasons = pd.Series([""] * len(df), index=df.index, dtype="object")
 
             if key_mode == "patient":
-                # 氏名・カナ氏名両方空欄、カナ氏名が記号のみ、もしくは生年月日<1900-01-01、または患者番号が空欄 → 対象外
-                name_col = colmap.get("患者氏名") or colmap.get("氏名")
-                kana_col = colmap.get("患者氏名カナ") or colmap.get("カナ氏名")
-                mask_name_empty = pd.Series([False] * len(df), index=df.index)
-                mask_kana_empty = pd.Series([False] * len(df), index=df.index)
-                # --- 新ルール: 患者番号が空欄 ---
-                code_col = colmap.get("患者番号")
-                mask_code_empty = pd.Series([False] * len(df), index=df.index)
-                if code_col and code_col in df.columns:
-                    mask_code_empty = _digits_or_empty(df[code_col]).map(lambda s: s == "")
-                # ---------------------------
-                # --- 新ルール: 患者番号の重複（先頭0を無視して比較） ---
-                mask_code_dup = pd.Series([False] * len(df), index=df.index)
-                if code_col and code_col in df.columns:
-                    code_digits = _digits_or_empty(df[code_col]).str.lstrip("0")
-                    mask_code_dup = code_digits.duplicated(keep=False) & (code_digits != "")
-                # ---------------------------
-                if name_col and name_col in df.columns:
-                    s_name = df[name_col]
-                    mask_name_empty = (
-                        s_name.isna() |
-                        s_name.astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
-                    )
-                if kana_col and kana_col in df.columns:
-                    s_kana = df[kana_col]
-                    mask_kana_empty = (
-                        s_kana.isna() |
-                        s_kana.astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
-                    )
-                mask_both_empty = mask_name_empty & mask_kana_empty
-                # カナ氏名が記号のみ（= カナ/ひらがな/長音符が1文字も無く、非空）
-                import re, unicodedata
-                mask_kana_symbols = pd.Series([False] * len(df), index=df.index)
-                if kana_col and kana_col in df.columns:
-                    s_kana = df[kana_col]
-                    def _is_symbols_only(val: object) -> bool:
-                        if val is None:
-                            return False
-                        s = unicodedata.normalize("NFKC", str(val)).strip()
-                        if s == "":
-                            return False  # 空欄は別ロジックで判定
-                        # カナ/ひらがな/長音符のみを残す（スペースは除去）
-                        kana_kept = re.sub(r"[^ーｰ\u30A0-\u30FF\u3040-\u309F]", "", s)
-                        # 残らなければカナ成分ゼロ → 記号等のみ
-                        return kana_kept == ""
-                    mask_kana_symbols = s_kana.map(_is_symbols_only)
-                # 生年月日 < 1900-01-01 → 対象外
-                birth_col = colmap.get("生年月日")
-                mask_birth_old = pd.Series([False] * len(df), index=df.index)
-                if birth_col and birth_col in df.columns:
-                    norm_birth = df[birth_col].map(lambda s: inspection._parse_date_any_to_yyyymmdd(str(s)) if s is not None else "")
-                    def _is_old(yyyymmdd: str) -> bool:
-                        if not yyyymmdd or len(yyyymmdd) != 8:
-                            return False
-                        return int(yyyymmdd[:4]) < 1900
-                    mask_birth_old = norm_birth.map(_is_old)
-                mask = mask_code_empty | mask_both_empty | mask_birth_old | mask_kana_symbols | mask_code_dup
-                # 理由を付与
-                reasons.loc[mask_code_empty] = reasons.loc[mask_code_empty].astype(str).str.cat(
-                    pd.Series(["患者番号空欄"] * int(mask_code_empty.sum()), index=reasons.loc[mask_code_empty].index),
-                    sep=" / "
-                ).str.strip(" /")
-                reasons.loc[mask_both_empty] = reasons.loc[mask_both_empty].astype(str).str.cat(
-                    pd.Series(["氏名・カナ氏名空欄"] * int(mask_both_empty.sum()), index=reasons.loc[mask_both_empty].index),
-                    sep=" / "
-                ).str.strip(" /")
-                reasons.loc[mask_kana_symbols] = reasons.loc[mask_kana_symbols].astype(str).str.cat(
-                    pd.Series(["カナ氏名記号のみ"] * int(mask_kana_symbols.sum()), index=reasons.loc[mask_kana_symbols].index),
-                    sep=" / "
-                ).str.strip(" /")
-                reasons.loc[mask_birth_old] = reasons.loc[mask_birth_old].astype(str).str.cat(
-                    pd.Series(["生年月日1900年未満"] * int(mask_birth_old.sum()), index=reasons.loc[mask_birth_old].index),
-                    sep=" / "
-                ).str.strip(" /")
-                reasons.loc[mask_code_dup] = reasons.loc[mask_code_dup].astype(str).str.cat(
-                    pd.Series(["患者番号重複"] * int(mask_code_dup.sum()), index=reasons.loc[mask_code_dup].index),
-                    sep=" / "
-                ).str.strip(" /")
+                # 患者ルールは core.rules.patient に集約（公費と同じ設計）
+                try:
+                    from core.rules.patient import evaluate_patient_exclusions, PatientRuleConfig
+                except Exception as e:
+                    # ルール読込失敗時は空を返す（上位で素通し扱い）
+                    self._log(f"[patient] ルール読込エラー: {type(e).__name__}: {e}")
+                    return src.head(0)
+
+                # UI マッピング（colmap）はそのまま渡せば OK（患者番号/氏名/カナ/生年月日のキーを含む想定）
+                cfg_rules = PatientRuleConfig()
+
+                try:
+                    remains, excluded = evaluate_patient_exclusions(df, colmap, cfg_rules)
+                except Exception as e:
+                    self._log(f"[patient] 対象外抽出 例外: {type(e).__name__}: {e}")
+                    excluded = pd.DataFrame(columns=["__対象外理由__"])  # 空で返す
+
+                return excluded
 
             elif key_mode == "insurance":
                 payer_col = colmap.get("保険者番号")
