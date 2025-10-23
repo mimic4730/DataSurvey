@@ -110,13 +110,6 @@ class DataSurveyApp(tk.Tk):
             state=tk.DISABLED
         )
         self.btn_patient_content.pack(side="left", padx=(0,6))
-        self.btn_insurance_content = ttk.Button(
-            content_btns,
-            text="内容検収(保険)",
-            command=self._run_insurance_content_check,
-            state=tk.DISABLED
-        )
-        self.btn_insurance_content.pack(side="left", padx=(0,6))
         self.btn_public_content = ttk.Button(
             content_btns,
             text="内容検収(公費)",
@@ -539,8 +532,7 @@ class DataSurveyApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("エラー", f"保険情報の検収CSV生成でエラーが発生しました。\n{e}")
             return
-        if ok and hasattr(self, 'btn_insurance_content') and self.btn_insurance_content:
-            self.btn_insurance_content.configure(state=tk.NORMAL)
+        # 保険内容検収ボタンの有効化を削除
 
     def _wrap_run_public_generate(self):
         try:
@@ -568,13 +560,7 @@ class DataSurveyApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("エラー", f"患者の内容検収でエラーが発生しました。\n{e}")
 
-    def _run_insurance_content_check(self):
-        try:
-            self.actions.run_insurance_content_check()
-        except AttributeError:
-            messagebox.showerror("エラー", "run_insurance_content_check が見つかりません。inspection_actions.py を確認してください。")
-        except Exception as e:
-            messagebox.showerror("エラー", f"保険の内容検収でエラーが発生しました。\n{e}")
+    # _run_insurance_content_check メソッドを削除
 
     def _run_public_content_check(self):
         try:
