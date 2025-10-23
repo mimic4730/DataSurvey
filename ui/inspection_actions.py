@@ -1348,6 +1348,32 @@ class InspectionActions:
             self._log(f"[{key_mode}] サマリ出力に失敗しました")
 
         self._prog_close()
+        
+        # ▼▼ 患者：内容検収を統合実行（ダイアログ無し・同一出力ディレクトリ） ▼▼
+        if key_mode == "patient":
+            try:
+                from ui.patient_content_check import run_integrated as _run_patient_content_integrated
+                _res = _run_patient_content_integrated(
+                    src_df=src,
+                    colmap=colmap,
+                    cmp_path=cmp_path,
+                    out_dir=out_dir,
+                    logger=self._log
+                )
+                try:
+                    self._log(
+                        f"[患者-内容] 統合出力: 一致={_res.get('matched_count', 0)} / "
+                        f"変換一致={_res.get('conv_matched_count', 0)} / "
+                        f"不一致明細={_res.get('mismatch_count', 0)} / "
+                        f"未ヒット={_res.get('missing_count', 0)} / "
+                        f"対象外={_res.get('excluded_count', 0)}"
+                    )
+                except Exception:
+                    pass
+            except Exception as _e:
+                self._log(f"[patient] 内容検収の統合実行に失敗: {type(_e).__name__}: {_e}")
+        
+        
         return summary
 
     # === 各アクション ===

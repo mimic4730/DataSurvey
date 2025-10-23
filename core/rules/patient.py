@@ -1,3 +1,7 @@
+"""
+患者情報の『移行対象外』判定ルールの単一ソース。
+- 検収CSV生成フローおよび内容検収（ui.patient_content_check.run_integrated）双方から参照されます。
+"""
 #core/rules/patient.py
 from __future__ import annotations
 import pandas as pd

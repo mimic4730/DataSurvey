@@ -42,10 +42,10 @@ class DataSurveyApp(tk.Tk):
         self.config(menu=menubar)
 
         inspection_menu = tk.Menu(menubar, tearoff=0)
-        inspection_menu.add_command(label="患者情報検収CSVを生成", command=self._wrap_run_patient_generate)
-        inspection_menu.add_command(label="保険情報検収CSVを生成", command=self._wrap_run_insurance_generate)
-        inspection_menu.add_command(label="公費情報検収CSVを生成", command=self._wrap_run_public_generate)
-        inspection_menu.add_command(label="限度額情報検収CSVを生成",command=self._wrap_run_ceiling_generate)
+        inspection_menu.add_command(label="患者情報検収", command=self._wrap_run_patient_generate)
+        inspection_menu.add_command(label="保険情報検収", command=self._wrap_run_insurance_generate)
+        inspection_menu.add_command(label="公費情報検収", command=self._wrap_run_public_generate)
+        inspection_menu.add_command(label="限度額情報検収",command=self._wrap_run_ceiling_generate)
         inspection_menu.add_separator()
         inspection_menu.add_command(label="未ヒット患者（検収元→検収用）をCSV出力", command=self.actions.run_missing)
         menubar.add_cascade(label="検収", menu=inspection_menu)
@@ -103,13 +103,6 @@ class DataSurveyApp(tk.Tk):
         # ▼ 内容検収ボタン群
         content_btns = ttk.Frame(self.page_inspect)
         content_btns.pack(fill="x", padx=10, pady=(0,10))
-        self.btn_patient_content = ttk.Button(
-            content_btns,
-            text="内容検収(患者)",
-            command=self._run_patient_content_check,
-            state=tk.DISABLED
-        )
-        self.btn_patient_content.pack(side="left", padx=(0,6))
         self.btn_public_content = ttk.Button(
             content_btns,
             text="内容検収(公費)",
@@ -523,8 +516,6 @@ class DataSurveyApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("エラー", f"患者情報の検収CSV生成でエラーが発生しました。\n{e}")
             return
-        if ok and hasattr(self, 'btn_patient_content') and self.btn_patient_content:
-            self.btn_patient_content.configure(state=tk.NORMAL)
 
     def _wrap_run_insurance_generate(self):
         try:
@@ -551,14 +542,6 @@ class DataSurveyApp(tk.Tk):
             return
         if ok and hasattr(self, 'btn_ceiling_content') and self.btn_ceiling_content:
             self.btn_ceiling_content.configure(state=tk.NORMAL)
-
-    def _run_patient_content_check(self):
-        try:
-            self.actions.run_patient_content_check()
-        except AttributeError:
-            messagebox.showerror("エラー", "run_patient_content_check が見つかりません。inspection_actions.py を確認してください。")
-        except Exception as e:
-            messagebox.showerror("エラー", f"患者の内容検収でエラーが発生しました。\n{e}")
 
     # _run_insurance_content_check メソッドを削除
 

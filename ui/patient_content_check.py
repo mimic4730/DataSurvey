@@ -572,6 +572,215 @@ class PatientContentChecker:
             f"出力先:\n{out_dir}"
         )
 
+def run_integrated(*, src_df: pd.DataFrame, colmap: dict, cmp_path: str, out_dir, logger=None) -> dict:
+    """
+    検収CSV生成フローから呼び出す、ダイアログなしの『患者・内容検収』実行関数。
+    - src_df, colmap, cmp_path, out_dir をそのまま使用（UIダイアログなし）
+    - 出力は out_dir 直下に
+        患者_内容_一致_YYYYMMDD.csv
+        患者_内容_変換一致_YYYYMMDD.csv
+        患者_内容_不一致_YYYYMMDD.csv
+        患者_内容_未ヒット_YYYYMMDD.csv
+        患者_内容_対象外_YYYYMMDD.csv
+      を保存
+    """
+    checker = PatientContentChecker(logger=logger, preset_colmap=None)
+    def log(msg: str):
+        checker.log(msg)
+    tag = _dt.now().strftime("%Y%m%d")
+
+    # 0) 入力
+    src = src_df.copy()
+    cmp_df = CsvLoader.read_csv_flex(cmp_path)
+
+    # 1) 対象外（患者ルール）
+    excluded_count = 0
+    try:
+        if evaluate_patient_exclusions is not None:
+            cfg = PatientRuleConfig() if PatientRuleConfig is not None else None
+            remains_df, excluded_df = evaluate_patient_exclusions(src, colmap, cfg)  # type: ignore
+            if isinstance(excluded_df, pd.DataFrame) and not excluded_df.empty:
+                excluded_count = len(excluded_df)
+                out_ex = Path(out_dir) / f"患者_内容_対象外_{tag}.csv"
+                inspection.to_csv(excluded_df, str(out_ex))
+                log(f"[患者-内容] 対象外: {excluded_count} 件 → {out_ex}")
+            src = remains_df if isinstance(remains_df, pd.DataFrame) else src.head(0)
+        else:
+            log("[患者-内容] 対象外ルールが見つからないため、全件比較します")
+    except Exception as _e:
+        log(f"[患者-内容] 対象外ルール適用で例外（スキップ）: {_e}")
+
+    # 2) キー幅推定
+    import re, unicodedata
+    def _digits_len_max(s: pd.Series) -> int:
+        return int(s.astype(str).map(lambda x: re.sub(r"[^0-9]", "", unicodedata.normalize("NFKC", x))).str.len().max() or 0)
+    src_w = _digits_len_max(src[colmap.get("患者番号")]) if colmap.get("患者番号") in src.columns else 0
+    cmp_w = _digits_len_max(cmp_df["患者番号"]) if "患者番号" in cmp_df.columns else 0
+    width = max(src_w, cmp_w, 1)
+    log(f"[患者-内容] 患者番号桁数: 元={src_w} / 突合={cmp_w} / 使用幅={width}")
+
+    # 3) 元CSV 正規化（run と同一）
+    norm = checker._normalize_codes
+    src_key = norm(src[colmap.get("患者番号")].astype(str), width, mode="zfill") if colmap.get("患者番号") in src.columns else pd.Series([""]*len(src))
+    src_kana = (src[colmap.get("患者氏名カナ")].map(checker._norm_kana_for_compare)
+                if colmap.get("患者氏名カナ") in src.columns else pd.Series([""]*len(src)))
+    src_name_raw = (src[colmap.get("患者氏名")] if colmap.get("患者氏名") in src.columns else pd.Series([""]*len(src)))
+    src_name_norm = src_name_raw.map(checker._norm_name_for_compare)
+    # 氏名：文字化け/空欄 → カナ補完
+    try:
+        mojibake_mask = checker._looks_mojibake(src_name_raw)
+    except Exception:
+        mojibake_mask = pd.Series([False]*len(src_name_norm), index=src_name_norm.index)
+    empty_mask = src_name_norm.str.strip().eq("")
+    replace_mask = (mojibake_mask | empty_mask)
+    src_name_filled = src_name_norm.mask(replace_mask, other=src_kana)
+    # 性別/生年月日/年齢/郵便/住所/電話（電話は携帯格上げの2系統）
+    src_sex   = (src[colmap.get("性別")].map(checker._norm_gender_for_compare)
+                 if colmap.get("性別") in src.columns else pd.Series([""]*len(src)))
+    src_birth = (src[colmap.get("生年月日")].map(checker._norm_birth_for_compare)
+                 if colmap.get("生年月日") in src.columns else pd.Series([""]*len(src)))
+    src_age   = src_birth.map(checker._norm_age_from_birth)
+    src_zip   = (src[colmap.get("郵便番号")].map(checker._norm_zip_for_compare)
+                 if colmap.get("郵便番号") in src.columns else pd.Series([""]*len(src)))
+    # 住所は「住所1」「住所１」どちらでも拾う
+    _addr_key = "住所１" if "住所１" in src.columns else ("住所1" if "住所1" in src.columns else None)
+    src_addr  = (src[_addr_key].map(checker._norm_addr_for_compare) if _addr_key else pd.Series([""]*len(src)))
+    tel_base_str, tel_conv_str, phone_used_mask = checker._phone_upgrade_pair(
+        src, colmap.get("電話番号"), colmap.get("携帯電話番号")
+    )
+    src_tel_base = tel_base_str.map(checker._norm_tel_for_compare)
+    src_tel_conv = tel_conv_str.map(checker._norm_tel_for_compare)
+    try:
+        phone_replaced_keys = set(src_key[phone_used_mask].tolist())
+    except Exception:
+        phone_replaced_keys = set()
+    name_replaced_keys = set(src_key[replace_mask].tolist())
+    def _rule_for_key(k):
+        flags = []
+        if k in name_replaced_keys:  flags.append("氏名→カナ補完")
+        if k in phone_replaced_keys: flags.append("電話→携帯補完")
+        return " + ".join(flags) if flags else "SRC補正"
+    # 2系統（ベース/補正）
+    fields = ["患者氏名カナ","患者氏名","性別","生年月日","年齢","郵便番号","住所１","電話番号"]
+    src_norm_base = pd.DataFrame({
+        "患者番号": src_key, "患者氏名カナ": src_kana, "患者氏名": src_name_norm, "性別": src_sex,
+        "生年月日": src_birth, "年齢": src_age, "郵便番号": src_zip, "住所１": src_addr, "電話番号": src_tel_base
+    })
+    src_norm_conv = pd.DataFrame({
+        "患者番号": src_key, "患者氏名カナ": src_kana, "患者氏名": src_name_filled, "性別": src_sex,
+        "生年月日": src_birth, "年齢": src_age, "郵便番号": src_zip, "住所１": src_addr, "電話番号": src_tel_conv
+    })
+    # 4) 突合側 正規化（run と同一）
+    if "患者番号" not in cmp_df.columns:
+        return {"error": "突合CSVに『患者番号』列がありません。"}
+    cmp_key = checker._normalize_codes(cmp_df["患者番号"].astype(str), width, mode="zfill")
+    CMP_ALIASES = {
+        "患者氏名カナ": ["患者氏名カナ","カナ氏名","ﾌﾘｶﾞﾅ","フリガナ"],
+        "患者氏名": ["患者氏名","氏名","名前"],
+        "性別": ["性別","性","男女区分"],
+        "生年月日": ["生年月日","誕生日","出生年月日"],
+        "郵便番号": ["郵便番号","郵便No","郵便番号１","郵便番号1"],
+        "住所１": ["住所１","住所1","住所","住所_1"],
+        "電話番号": ["電話番号","電話","TEL","Tel","電話番号１","電話番号1"],
+    }
+    def _get_cmp(col: str) -> pd.Series:
+        if col in cmp_df.columns: return cmp_df[col]
+        for cand in CMP_ALIASES.get(col, []):
+            if cand in cmp_df.columns: return cmp_df[cand]
+        if col == "住所１" and "住所1" in cmp_df.columns: return cmp_df["住所1"]
+        if col == "郵便番号" and "郵便番号1" in cmp_df.columns: return cmp_df["郵便番号1"]
+        if col == "電話番号" and "電話番号1" in cmp_df.columns: return cmp_df["電話番号1"]
+        return pd.Series([""]*len(cmp_df))
+    cmp_kana_norm = _get_cmp("患者氏名カナ").map(checker._norm_kana_for_compare)
+    cmp_name_norm = _get_cmp("患者氏名").map(checker._norm_name_for_compare)
+    cmp_name_filled = cmp_name_norm.mask(cmp_name_norm.str.strip() == "", other=cmp_kana_norm)
+    cmp_norm = pd.DataFrame({
+        "患者番号": cmp_key,
+        "患者氏名カナ": cmp_kana_norm,
+        "患者氏名": cmp_name_filled,
+        "性別": _get_cmp("性別").map(checker._norm_gender_for_compare),
+        "生年月日": _get_cmp("生年月日").map(checker._norm_birth_for_compare),
+        "郵便番号": _get_cmp("郵便番号").map(checker._norm_zip_for_compare),
+        "住所１": _get_cmp("住所１").map(checker._norm_addr_for_compare),
+        "電話番号": _get_cmp("電話番号").map(checker._norm_tel_for_compare),
+    })
+    cmp_norm["年齢"] = cmp_norm["生年月日"].map(checker._norm_age_from_birth)
+
+    # 5) 完全重複の削除
+    dup_subset = ["患者番号","患者氏名カナ","患者氏名","性別","生年月日","年齢","郵便番号","住所１","電話番号"]
+    src_norm_base = src_norm_base.drop_duplicates(subset=dup_subset, keep="first")
+    src_norm_conv = src_norm_conv.drop_duplicates(subset=dup_subset, keep="first")
+    cmp_norm      = cmp_norm.drop_duplicates(subset=dup_subset, keep="first")
+
+    # 6) 未ヒット（キー：患者番号）
+    src_norm_base = src_norm_base[src_norm_base["患者番号"] != ""].copy()
+    src_norm_conv = src_norm_conv[src_norm_conv["患者番号"] != ""].copy()
+    cmp_norm      = cmp_norm[cmp_norm["患者番号"]      != ""].copy()
+    src_keys_all  = set(src_norm_base["患者番号"].tolist())
+    cmp_key_set   = set(cmp_norm["患者番号"].tolist())
+    missing_keys  = src_keys_all - cmp_key_set
+    missing_index = src_norm_base.index[src_norm_base["患者番号"].isin(missing_keys)]
+    missing_df    = src.loc[missing_index].copy()
+    missing_df.insert(0, "__正規化患者番号__", src_norm_base.loc[missing_index, "患者番号"])
+
+    # 7) Pass-1 厳密一致 / Pass-2（SRC補正）
+    merged1 = src_norm_base.merge(cmp_norm, on="患者番号", how="inner", suffixes=("_src","_cmp"))
+    all_eq_mask1 = pd.Series([True]*len(merged1), index=merged1.index)
+    for f in fields: all_eq_mask1 &= (merged1[f+"_src"] == merged1[f+"_cmp"])
+    matched_rows_strict = merged1.loc[all_eq_mask1, ["患者番号"]+[f+"_src" for f in fields]].copy()
+    matched_rows_strict.rename(columns={f+"_src": f for f in fields}, inplace=True)
+
+    remain_keys = set(src_norm_base["患者番号"]) - set(matched_rows_strict["患者番号"])
+    src_conv_slice = src_norm_conv[src_norm_conv["患者番号"].isin(remain_keys)]
+    merged2 = src_conv_slice.merge(cmp_norm, on="患者番号", how="inner", suffixes=("_src","_cmp"))
+    all_eq_mask2 = pd.Series([True]*len(merged2), index=merged2.index)
+    for f in fields: all_eq_mask2 &= (merged2[f+"_src"] == merged2[f+"_cmp"])
+    matched_rows_conv = merged2.loc[all_eq_mask2, ["患者番号"]+[f+"_src" for f in fields]].copy()
+    matched_rows_conv.rename(columns={f+"_src": f for f in fields}, inplace=True)
+    matched_rows_conv["適用ルール"] = matched_rows_conv["患者番号"].map(_rule_for_key)
+
+    # 8) 不一致明細（Pass-1 基準の生差分）
+    base_diff_rows = merged1.loc[~all_eq_mask1].copy()
+    mismatches = []
+    for f in fields:
+        neq = base_diff_rows.loc[base_diff_rows[f+"_src"] != base_diff_rows[f+"_cmp"], ["患者番号", f+"_src", f+"_cmp"]].copy()
+        if not neq.empty:
+            neq.insert(1, "項目名", f)
+            neq.rename(columns={f+"_src": "正規化_元", f+"_cmp": "正規化_突合"}, inplace=True)
+            mismatches.append(neq)
+    mismatch_df = pd.concat(mismatches, axis=0) if mismatches else pd.DataFrame(columns=["患者番号","項目名","正規化_元","正規化_突合"])
+    try:
+        resolved_keys = set(matched_rows_conv["患者番号"].tolist())
+        if not mismatch_df.empty:
+            mismatch_df["変換で解消"] = mismatch_df["患者番号"].map(lambda k: "はい" if k in resolved_keys else "いいえ")
+    except Exception:
+        pass
+
+    # 9) 出力
+    out_dir = Path(out_dir)
+    out_matched  = out_dir / f"患者_内容_一致_{tag}.csv"
+    out_conv     = out_dir / f"患者_内容_変換一致_{tag}.csv"
+    out_mismatch = out_dir / f"患者_内容_不一致_{tag}.csv"
+    out_missing  = out_dir / f"患者_内容_未ヒット_{tag}.csv"
+    inspection.to_csv(matched_rows_strict, str(out_matched))
+    inspection.to_csv(matched_rows_conv,  str(out_conv))
+    inspection.to_csv(mismatch_df,        str(out_mismatch))
+    inspection.to_csv(missing_df,         str(out_missing))
+    log(f"[患者-内容] 一致: {len(matched_rows_strict)} / 変換一致: {len(matched_rows_conv)} / 不一致明細行: {len(mismatch_df)} / 未ヒット: {len(missing_df)} / 対象外: {excluded_count}")
+
+    return {
+        "matched_path": str(out_matched),
+        "conv_matched_path": str(out_conv),
+        "mismatch_path": str(out_mismatch),
+        "missing_path": str(out_missing),
+        "excluded_path": str(out_dir / f"患者_内容_対象外_{tag}.csv"),
+        "matched_count": int(len(matched_rows_strict)),
+        "conv_matched_count": int(len(matched_rows_conv)),
+        "mismatch_count": int(len(mismatch_df)),
+        "missing_count": int(len(missing_df)),
+        "excluded_count": int(excluded_count),
+    }
+
 # ===== Entry points for InspectionActions =====
 def run_patient_content_check(app, logger=None, preset=None):
     checker = PatientContentChecker(logger=logger, preset_colmap=preset)
