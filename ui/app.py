@@ -100,24 +100,6 @@ class DataSurveyApp(tk.Tk):
         ttk.Button(btns, text="検収CSV生成(公費)", command=self._wrap_run_public_generate).pack(side="left")
         ttk.Button(btns, text="検収CSV生成(限度額)", command=self._wrap_run_ceiling_generate).pack(side="left")
 
-        # ▼ 内容検収ボタン群
-        content_btns = ttk.Frame(self.page_inspect)
-        content_btns.pack(fill="x", padx=10, pady=(0,10))
-        self.btn_public_content = ttk.Button(
-            content_btns,
-            text="内容検収(公費)",
-            command=self._run_public_content_check,
-            state=tk.DISABLED
-        )
-        self.btn_public_content.pack(side="left")
-        self.btn_ceiling_content = ttk.Button(
-            content_btns,
-            text="内容検収(限度額)",
-            command=self._run_ceiling_content_check,
-            state=tk.DISABLED
-        )
-        self.btn_ceiling_content.pack(side="left", padx=(0,6))
-
         # ログテキスト（積み上げ式）
         log_frame = ttk.LabelFrame(self.page_inspect, text="ログ")
         log_frame.pack(expand=True, fill="both", padx=10, pady=(4,10))
@@ -165,8 +147,6 @@ class DataSurveyApp(tk.Tk):
             "◆ データ移行日\n"
             "検収ページ右上の『データ移行日』は、保険/公費の期限切れ判定に共通で使用します。\n"
             "例：2024-07-10, 2024/7/10, R6.7.10 などを入力可能です。\n"
-            "\n"
-            "※ 詳細ルールは運用に合わせて随時拡張可能です。\n"
         )
         try:
             self.log_text.delete("1.0", "end")

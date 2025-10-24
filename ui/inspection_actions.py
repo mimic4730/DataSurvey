@@ -1373,6 +1373,32 @@ class InspectionActions:
             except Exception as _e:
                 self._log(f"[patient] 内容検収の統合実行に失敗: {type(_e).__name__}: {_e}")
         
+        if key_mode == "public":
+            try:
+                from core.rules.public import run_public_content_integrated as _run_public_content_integrated
+                # migration は UI で取得済みのものを渡せるなら渡す
+                mig = None
+                try:
+                    if hasattr(self, "_get_migration_date"):
+                        mig = self._get_migration_date()
+                except Exception:
+                    mig = None
+                _res_pub = _run_public_content_integrated(
+                    src_df=src,
+                    colmap_src=colmap,
+                    cmp_path=cmp_path,
+                    out_dir=out_dir,
+                    logger=self._log,
+                    migration_yyyymmdd=mig,
+                )
+                try:
+                    self._log(
+                        f"[公費-内容] 統合出力: 一致={_res_pub.get('matched_count', 0)} / 不一致明細={_res_pub.get('mismatch_count', 0)} / 未ヒット={_res_pub.get('missing_count', 0)} / 対象外={_res_pub.get('excluded_count', 0)}"
+                    )
+                except Exception:
+                    pass
+            except Exception as _e:
+                self._log(f"[public] 内容検収の統合実行に失敗: {type(_e).__name__}: {_e}")
         
         return summary
 
@@ -1510,7 +1536,7 @@ class InspectionActions:
                 self._prog_close()
             out_dir = self._prepare_output_dir(in_path, "public")
             self._log(f"[公費] 出力先ディレクトリ: {out_dir}")
-            required_cols = list(inspection.COLUMNS_PUBLIC) + ["公費終了日１", "公費終了日２"]
+            required_cols = list(inspection.COLUMNS_PUBLIC)
             colmap = self.app._ask_inspection_colmap(src, required_cols=required_cols)
             if colmap is None:
                 return False
@@ -1527,7 +1553,7 @@ class InspectionActions:
                 src,
                 colmap,
                 cfg,
-                target_columns=list(inspection.COLUMNS_PUBLIC) + ["公費終了日１", "公費終了日２"]
+                target_columns=list(inspection.COLUMNS_PUBLIC)
             )
 
             default_name = f"公費_検収_{_dt.now().strftime('%Y%m%d')}.csv"
@@ -1641,138 +1667,3 @@ class InspectionActions:
             messagebox.showinfo("完了", f"未ヒット {len(missing_df)} 件を出力しました。\n{out_path}")
         except Exception as e:
             messagebox.showerror("エラー", f"未ヒットリストの保存に失敗しました。\n{e}")
-
-    def run_patient_content_check(self) -> bool:
-        """患者情報の内容検収を実行（patient_content_check.py を呼び出す）。"""
-        try:
-            # 遅延インポート（起動時の ImportError を回避）
-            from . import patient_content_check as _pcc
-        except Exception as e:
-            messagebox.showerror(
-                "エラー",
-                "患者情報の内容検収モジュール(ui/patient_content_check.py)の読み込みに失敗しました。\n"
-                f"{e}\n\nファイル名・配置パスを確認してください。"
-            )
-            return False
-
-        # 実行関数を候補名から解決
-        func = None
-        for name in ("run_patient_content_check", "run", "main"):
-            f = getattr(_pcc, name, None)
-            if callable(f):
-                func = f
-                break
-
-        if func is None:
-            messagebox.showerror(
-                "エラー",
-                "ui/patient_content_check.py に実行関数が見つかりません。\n"
-                "次のいずれかの関数名で定義してください: run_patient_content_check / run / main"
-            )
-            return False
-
-        try:
-            maps = self._load_colmaps()
-            preset = maps.get("patient")
-            try:
-                # 関数シグネチャに 'logger' 引数があるか簡易判定
-                import inspect
-                sig = inspect.signature(func)
-                kwargs = {}
-                if 'logger' in sig.parameters:
-                    kwargs['logger'] = self._logger
-                if 'preset' in sig.parameters:
-                    kwargs['preset'] = preset
-                ok = func(self.app, **kwargs) if kwargs else func(self.app)
-            except Exception:
-                # シグネチャ取得に失敗した場合は素直に2引数トライ→1引数トライ
-                try:
-                    ok = func(self.app, logger=self._logger, preset=preset)
-                except Exception:
-                    ok = func(self.app)
-            return bool(ok)
-        except Exception as e:
-            messagebox.showerror("エラー", f"患者情報の内容検収でエラーが発生しました。\n{e}")
-            return False
-
-    def run_insurance_content_check(self) -> bool:
-        try:
-            # 遅延インポート
-            from . import insurance_content_check as _icc
-        except Exception as e:
-            messagebox.showerror("エラー", f"保険情報の内容検収モジュールの読み込みに失敗しました。\n{e}")
-            return False
-
-        # 実行関数を解決
-        func = None
-        for name in ("run_insurance_content_check", "run", "main"):
-            f = getattr(_icc, name, None)
-            if callable(f):
-                func = f; break
-        if func is None:
-            messagebox.showerror("エラー", "ui/insurance_content_check.py に実行関数が見つかりません。")
-            return False
-
-        # マッピングのプリセットをロード
-        maps = self._load_colmaps()
-        preset = maps.get("insurance")
-
-        # 検収ページの移行日（共通入力）を取得
-        mig = None
-        try:
-            mig = self._get_migration_date()  # 既存の共通関数（yyyymmdd を返す実装ならそのまま）
-        except Exception:
-            mig = None
-
-        # 呼び出し（logger/preset/migration_date を渡す）
-        try:
-            return bool(func(self.app, logger=self._logger, preset=preset, migration_date=mig))
-        except TypeError:
-            # 旧シグネチャ互換
-            return bool(func(self.app, logger=self._logger, preset=preset))
-
-    def run_public_content_check(self) -> bool:
-        """公費情報の内容検収を実行（public_content_check.py を呼び出す）。"""
-        try:
-            # 遅延インポート
-            from . import public_content_check as _pcc
-        except Exception as e:
-            messagebox.showerror("エラー", f"公費情報の内容検収モジュールの読み込みに失敗しました。\n{e}")
-            return False
-
-        # 実行関数を解決（run_public_content_check / run / main の順で探す）
-        func = None
-        for name in ("run_public_content_check", "run", "main"):
-            f = getattr(_pcc, name, None)
-            if callable(f):
-                func = f
-                break
-        if func is None:
-            messagebox.showerror("エラー", "ui/public_content_check.py に実行関数が見つかりません。")
-            return False
-
-        # マッピングのプリセットをロード
-        maps = self._load_colmaps()
-        preset = maps.get("public")
-
-        # 検収ページの移行日（共通入力）を取得（ファイル側が受け取らない実装でも後方互換で呼び出し可）
-        mig = None
-        try:
-            mig = self._get_migration_date()
-        except Exception:
-            mig = None
-
-        # 呼び出し（logger / preset / migration_date を可能なら渡す）
-        try:
-            return bool(func(self.app, logger=self._logger, preset=preset, migration_date=mig))
-        except TypeError:
-            # migration_date を受け取らない旧シグネチャ互換
-            try:
-                return bool(func(self.app, logger=self._logger, preset=preset))
-            except TypeError:
-                # logger/preset も受け取らない場合
-                return bool(func(self.app))
-
-    def run_ceiling_content_check(self) -> bool:
-        messagebox.showinfo("未実装", "限度額の内容検収は現在未実装です。生成ロジックと併せて順次対応します。")
-        return False
