@@ -3,6 +3,7 @@ from __future__ import annotations
 from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
+
 class _ModalProgress(tk.Toplevel):
     def __init__(self, parent, title="処理中", message="処理中です…しばらくお待ちください"):
         super().__init__(parent)
@@ -90,18 +91,18 @@ class InspectionActions:
         except Exception:
             pass
 
-    # ▼ 追加: app から受け取ったロガーを保持
+    # app から受け取ったロガーを保持
     def set_logger(self, logger_callable):
         self._logger = logger_callable
 
-    # ▼ 追加: 検収ページの「データ移行日」入力欄から値を取得するためのプロバイダを登録
+    # 検収ページの「データ移行日」入力欄から値を取得するためのプロバイダを登録
     def set_migration_provider(self, provider_callable):
         """
         provider_callable: 呼び出し時に文字列を返す関数（例: lambda: entry.get()）
         """
         self._migration_provider = provider_callable
 
-    # ▼ 追加: コード側から直接移行日を更新したい場合（手動設定用）
+    # コード側から直接移行日を更新したい場合（手動設定用）
     def set_migration_date(self, raw_value: str | None):
         """
         raw_value: 'YYYYMMDD' や '2024/07/10', 'R6.7.10' のような表記を許容。
@@ -117,7 +118,7 @@ class InspectionActions:
             self.public_migration_yyyymmdd = yyyymmdd
             self._log(f"[共通] 移行日を設定: {yyyymmdd}")
 
-    # ▼ 追加: 現在有効な移行日を取得（UI → 解析 → キャッシュ）
+    # 現在有効な移行日を取得（UI → 解析 → キャッシュ）
     def _get_migration_date(self) -> str:
         """
         1) UIのプロバイダから取得して解釈成功ならそれを採用
@@ -151,7 +152,7 @@ class InspectionActions:
         self._log(f"[共通] 移行日未設定のため本日を採用: {today}")
         return today
     
-    # ▼ 追加: 共通ログ関数（ロガー未設定なら何もしない）
+    # 共通ログ関数（ロガー未設定なら何もしない）
     def _log(self, msg: str):
         try:
             if self._logger:
@@ -251,14 +252,9 @@ class InspectionActions:
         key_mode: "patient" | "insurance" | "public"
         戻り値: 対象外行のDataFrame（理由列 '__対象外理由__' を先頭に付与）
         """
-        def _digits_or_empty(series: pd.Series) -> pd.Series:
-            import re, unicodedata
-            return series.astype(str).map(lambda x: re.sub(r"[^0-9]", "", unicodedata.normalize("NFKC", x))).map(lambda x: x if x else "")
 
         try:
             df = src.copy()
-            payer_norm = None
-            reasons = pd.Series([""] * len(df), index=df.index, dtype="object")
 
             if key_mode == "patient":
                 # 患者ルールは core.rules.patient に集約（公費と同じ設計）
@@ -392,14 +388,7 @@ class InspectionActions:
                 # 不明モード
                 return src.head(0)
 
-            excluded = df.loc[mask].copy()
-            if not excluded.empty:
-                excluded.insert(0, "__対象外理由__", reasons.loc[excluded.index])
-                # 保険者番号の正規化は保険モードのときのみ挿入
-                if key_mode == "insurance" and payer_norm is not None:
-                    excluded.insert(1, "__正規化保険者番号__", payer_norm.loc[excluded.index])
-            self._log(f"[{key_mode}] 対象外抽出 完了: {len(excluded)}件")
-            return excluded
+            
         except Exception as e:
             # 失敗時は空のDF
             self._log(f"[{key_mode}] 対象外抽出でエラー: {type(e).__name__}: {e}。空データを返します")
@@ -423,7 +412,6 @@ class InspectionActions:
             "matched_path": None,
             "missing_path": None,
             "excluded_path": None,
-            # 追加: 日付（開始・終了）不一致レポート
             "dates_diff_count": 0,
             "dates_diff_path": None,
         }
