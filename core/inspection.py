@@ -5,6 +5,12 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, Iterable, Optional
+from core.rules.insurance import (
+    normalize_insurance_dates_for_migration,  # 保険日付の移行ルールに合わせた正規化
+    InsuranceRuleConfig,
+    normalize_insurance_keys,
+    InsuranceKeyConfig,
+)
 
 import pandas as pd
 
@@ -12,9 +18,10 @@ import pandas as pd
 INSPECTION_COLUMNS = [
     "患者番号", "患者氏名カナ", "患者氏名", "性別", "生年月日", "年齢",
     "郵便番号", "住所１", "電話番号",
-    "保険者番号", "患者負担割", "保険開始日", "保険終了日", "保険証記号", "保険証番号",
+    "保険者番号", "保険者番号ダミーコード", "患者負担割", "保険開始日", "保険終了日", "最終確認日", "保険証記号", "保険証番号",
     "公費負担者番号１", "公費受給者番号１", "公費開始日１",
     "公費負担者番号２", "公費受給者番号２", "公費開始日２",
+    "__key_patient__", "__key_payer__", "__key_sym__", "__key_start__", "__key_end__",
 ]
 
 # プリセット: 出力サブセット
@@ -23,7 +30,8 @@ COLUMNS_PATIENT = [
     "郵便番号", "住所１", "電話番号",
 ]
 COLUMNS_INSURANCE = [
-    "患者番号", "患者氏名", "生年月日", "保険者番号", "患者負担割", "保険証記号", "保険証番号", "保険開始日", "保険終了日",
+    "患者番号", "患者氏名", "生年月日", "保険者番号", "保険者番号ダミーコード", "患者負担割",
+    "保険証記号", "保険証番号", "保険開始日", "保険終了日", "最終確認日",
 ]
 COLUMNS_PUBLIC = [
     "患者番号", "公費負担者番号１", "公費負担者番号２", "公費受給者番号１", "公費受給者番号２",
@@ -202,6 +210,11 @@ def _zero_pad(s: str, width: int) -> str:
 class InspectionConfig:
     patient_number_width: int = 10  # 患者番号の 0 埋め桁数（任意桁数とあったためデフォルトは10）
     today: Optional[date] = None    # 年齢計算のための基準日（デフォルトは実行日）
+    # 保険者番号ダミーコード（検収UIでカンマ区切りで自由入力された値をそのまま渡す想定）
+    insurance_dummy_payer_codes: str = ""
+    # 元データ・移行後データの突合で使用する「データ移行日」（YYYYMMDD）
+    # None の場合は従来どおり単純な日付パースのみを行う
+    migration_yyyymmdd: Optional[str] = None
 
 # ========= メイン：患者情報の検収 =========
 def build_inspection_df(
@@ -241,6 +254,11 @@ def build_inspection_df(
 
     # 入力列を安全に取得するヘルパ
     def get(col_name: str) -> pd.Series:
+        # 「保険者番号ダミーコード」はCSV上の列ではなく、検収UIでの自由入力欄から渡ってくる値を使う
+        if col_name == "保険者番号ダミーコード":
+            raw = getattr(cfg, "insurance_dummy_payer_codes", "") or ""
+            return pd.Series([raw] * len(src_df), index=src_df.index, dtype="object")
+
         src_col = colmap.get(col_name)
         if src_col in src_df.columns:
             return src_df[src_col].astype(str)
@@ -279,12 +297,23 @@ def build_inspection_df(
 
     # 以降、保険・公費系
     out["保険者番号"] = get("保険者番号")
+    # 保険者番号ダミーコード: カンマ区切りでダミー頭2桁などを指定するための自由入力欄
+    out["保険者番号ダミーコード"] = get("保険者番号ダミーコード")
     out["患者負担割"] = get("患者負担割")
     out["保険証記号"] = get("保険証記号")
     out["保険証番号"] = get("保険証番号")
-    # 開始日を正規化
-    out["保険開始日"] = get("保険開始日").map(_parse_date_any_to_yyyymmdd)
-    out["保険終了日"] = get("保険終了日").map(_parse_date_any_to_yyyymmdd)
+
+    # 開始日・終了日・最終確認日を「保険の移行ルール」に合わせて正規化
+    # migration_yyyymmdd が None の場合は、内部で従来どおりの日付パース（yyyymmdd or 空欄）のみ行われる
+    start_raw = get("保険開始日")
+    end_raw = get("保険終了日")
+    confirm_raw = get("最終確認日")
+    start_norm, end_norm, confirm_norm = normalize_insurance_dates_for_migration(
+        start_raw, end_raw, confirm_raw, cfg.migration_yyyymmdd
+    )
+    out["保険開始日"] = start_norm
+    out["保険終了日"] = end_norm
+    out["最終確認日"] = confirm_norm
 
     out["公費負担者番号１"] = get("公費負担者番号１")
     out["公費受給者番号１"] = get("公費受給者番号１")
@@ -293,6 +322,22 @@ def build_inspection_df(
     out["公費負担者番号２"] = get("公費負担者番号２")
     out["公費受給者番号２"] = get("公費受給者番号２")
     out["公費開始日２"] = get("公費開始日２").map(_parse_date_any_to_yyyymmdd)
+
+    # 検収用突合キー列を追加（患者番号＋保険者番号＋記号番号＋開始日＋終了日）
+    key_cfg = InsuranceKeyConfig(
+        patient_width=cfg.patient_number_width,
+        payer_width=8,  # ログ上の保険者番号幅
+        # 元データと移行後データの突合で使う開始日補完ルールを InsuranceRuleConfig と揃える
+        migration_yyyymmdd=cfg.migration_yyyymmdd,
+    )
+    key_colmap = {
+        "患者番号": "患者番号",
+        "保険者番号": "保険者番号",
+        "保険証番号": "保険証番号",
+        "保険開始日": "保険開始日",
+        "保険終了日": "保険終了日",
+    }
+    out = normalize_insurance_keys(out, key_colmap, key_cfg)
 
     # カラム順を保証（カテゴリ指定があればそれを優先）
     cols_out = list(target_columns) if target_columns is not None else INSPECTION_COLUMNS

@@ -59,9 +59,591 @@ import json, os
 
 from core.io_utils import CsvLoader
 from core import inspection
+from core.rules.insurance import normalize_insurance_dates_for_migration  # 保険日付の正規化（移行ルールと共通化）
 
 
 class InspectionActions:
+    def _ask_and_save_missing_and_matched_insurance(
+        self,
+        *,
+        src: pd.DataFrame,
+        colmap: dict,
+        out_df: pd.DataFrame,
+        cfg: inspection.InspectionConfig,
+        out_dir: Path | None = None,
+    ) -> dict:
+        """
+        保険専用の簡潔な突合ロジック。
+
+        手順:
+          1) 移行ルール（core.rules.insurance）で src から対象外を除外
+          2) 対象レコードについて、患者番号 + 保険者番号 + 正規化した記号番号 + 開始日 + 終了日 で検索キーを作成
+          3) 移行後データ（検収CSV）側でも同じキーを作成し、集合で照合
+          4) 一致した対象レコードを「一致のみ」、一致しなかった対象レコードを「未ヒット」として出力
+             対象外は別ファイル「対象外」に出力
+        """
+        summary = {
+            "matched_count": 0,
+            "missing_count": 0,
+            "excluded_count": 0,
+            "matched_path": None,
+            "missing_path": None,
+            "excluded_path": None,
+            "dates_diff_count": 0,
+            "dates_diff_path": None,
+        }
+
+        today_tag = _dt.now().strftime("%Y%m%d")
+
+        def _path_in_dir(name: str) -> Path:
+            return (out_dir / name) if out_dir else Path(name)
+
+        import re, unicodedata
+        from tkinter import messagebox as _mb
+        import pandas as _pd
+
+        self._log("[insurance] 簡易突合ロジックで検収開始")
+        self._prog_open("検収中…（突合CSVの確認）")
+
+        # ---- 1) 突合対象CSVの選択 ----
+        cmp_path = filedialog.askopenfilename(
+            title="突合対象の検収用CSV（移行後データ）を選択してください",
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if not cmp_path:
+            self._log("[insurance] 突合CSV未選択のためスキップ")
+            self._prog_close()
+            return summary
+        self._log(f"[insurance] 突合CSV: {cmp_path}")
+
+        # 列ヘッダのみ取得
+        try:
+            try:
+                _hdr = _pd.read_csv(cmp_path, nrows=0, dtype=str, encoding="utf-8", engine="python")
+            except Exception:
+                _hdr = _pd.read_csv(cmp_path, nrows=0, dtype=str, encoding="cp932", engine="python")
+            cmp_columns = list(_hdr.columns)
+            self._log(f"[insurance] 突合CSV 列ヘッダ: {cmp_columns}")
+        except Exception as e:
+            self._log(f"[insurance] 突合CSV読込失敗: {type(e).__name__}: {e}")
+            self._prog_close()
+            return summary
+
+        if "患者番号" not in cmp_columns or "保険者番号" not in cmp_columns:
+            self._log("[insurance] 突合CSVに『患者番号』『保険者番号』がないためスキップ")
+            self._prog_close()
+            return summary
+
+        # ---- 2) 移行ルールで対象外を除外（src → remains / excluded） ----
+        src_pat_col = colmap.get("患者番号")
+        if not src_pat_col or src_pat_col not in src.columns:
+            self._log("[insurance] 元CSVに『患者番号』が無いためスキップ")
+            self._prog_close()
+            return summary
+
+        payer_src = colmap.get("保険者番号")
+        sym_src = colmap.get("保険証記号")
+        cno_src = colmap.get("保険証番号")
+        comb_src = colmap.get("記号番号")
+        start_src = colmap.get("保険開始日") or colmap.get("開始日")
+        end_src = colmap.get("保険終了日") or colmap.get("終了日")
+
+        if not payer_src or payer_src not in src.columns:
+            self._log("[insurance] 元CSVに『保険者番号』が無いためスキップ")
+            self._prog_close()
+            return summary
+
+        proc_colmap = {
+            "患者番号": src_pat_col,
+            "保険者番号": payer_src,
+            "保険証番号": cno_src or comb_src,
+            "保険終了日": end_src,
+            "最終確認日": (
+                colmap.get("保険最終確認日")
+                or colmap.get("最終確認日")
+            ),
+            "生年月日": colmap.get("生年月日"),
+        }
+
+        mig = None
+        try:
+            from core.rules.insurance import evaluate_insurance_exclusions, InsuranceRuleConfig
+            mig = self._get_migration_date()
+            dummy_codes = self._get_insurance_dummy_payer_codes()
+            cfg_rules = InsuranceRuleConfig(
+                migration_yyyymmdd=mig,
+                # 同一患者複数有効保険のうち非優先の判定に使う日付列
+                # （core.rules.insurance 側で 0 / 99999999 / 空欄 → 移行日 として扱う想定）
+                duplicate_date_column="最終確認日",
+                dummy_payer_prefixes=tuple(dummy_codes) if dummy_codes else (),
+            )
+            remains_src, excluded_df = evaluate_insurance_exclusions(src, proc_colmap, cfg_rules)
+        except Exception as e:
+            self._log(f"[insurance] 対象外抽出に失敗したため、全件を対象扱いにします: {type(e).__name__}: {e}")
+            remains_src = src.copy()
+            excluded_df = pd.DataFrame(columns=["__対象外理由__"])
+
+        if not isinstance(remains_src, pd.DataFrame):
+            remains_src = src.copy()
+        if not isinstance(excluded_df, pd.DataFrame):
+            excluded_df = pd.DataFrame(columns=["__対象外理由__"])
+
+        self._log(f"[insurance] 対象外算出: {len(excluded_df)}件 / 対象: {len(remains_src)}件")
+
+        # ---- 3) 正規化ヘルパ ----
+        _cache: dict[tuple, _pd.Series] = {}
+
+        # 保険者ダミー接頭語（例: 69, 88 など）を UI から取得し、突合時の正規化で利用
+        try:
+            dummy_payer_prefixes = tuple(self._get_insurance_dummy_payer_codes() or [])
+        except Exception:
+            dummy_payer_prefixes = ()
+
+        def _digits(series: _pd.Series, tag: str):
+            key = (tag, "digits", id(series))
+            if key in _cache:
+                return _cache[key]
+            s = series.astype(str).map(lambda x: re.sub(r"[^0-9]", "", unicodedata.normalize("NFKC", x)))
+            s = s.map(lambda d: "" if d == "" or set(d) == {"0"} else d)
+            _cache[key] = s
+            return s
+
+        def _strip_dummy_prefix(series: _pd.Series, tag: str):
+            """保険者番号からダミー接頭語を剥がす。
+            例: dummy_payer_prefixes = ("69",) のとき '69NNNNNN' → 'NNNNNN'
+            - 空文字はそのまま
+            - 接頭語と同じ長さしかない値（例: '69'）は剥がさない
+            """
+            key = (tag, "dummy_strip", id(series))
+            if key in _cache:
+                return _cache[key]
+
+            # ダミー接頭語が設定されていない場合は digits の結果をそのまま返す
+            if not dummy_payer_prefixes:
+                s = _digits(series, tag)
+                _cache[key] = s
+                return s
+
+            base = _digits(series, tag)
+            # 長い接頭語を優先してマッチさせる
+            prefixes = sorted(dummy_payer_prefixes, key=len, reverse=True)
+
+            def _strip(v: str) -> str:
+                if v == "":
+                    return ""
+                for pref in prefixes:
+                    if pref and v.startswith(pref) and len(v) > len(pref):
+                        return v[len(pref):]
+                return v
+
+            out = base.map(_strip)
+            _cache[key] = out
+            return out
+
+        def _zfill(series: _pd.Series, width: int, tag: str):
+            key = (tag, "zfill", width, id(series))
+            if key in _cache:
+                return _cache[key]
+            d = _digits(series, tag)
+            z = d.map(lambda x: x.zfill(width) if x else "")
+            _cache[key] = z
+            return z
+
+        def _payer_pad(series: _pd.Series, tag: str):
+            key = (tag, "payer_pad", id(series))
+            if key in _cache:
+                return _cache[key]
+            # まず数字だけに正規化し、保険者ダミー接頭語が設定されていれば剥がしてから桁補正
+            if dummy_payer_prefixes:
+                d = _strip_dummy_prefix(series, tag)
+            else:
+                d = _digits(series, tag)
+
+            def _pad(v: str) -> str:
+                if v == "":
+                    return ""
+                n = len(v)
+                if n == 7:
+                    return v.zfill(8)
+                if n == 5:
+                    return v.zfill(6)
+                return v
+
+            out = d.map(_pad)
+            _cache[key] = out
+            return out
+
+        def _payer_for_mode(series: _pd.Series, tag: str):
+            p = _payer_pad(series, tag)
+            return p  # 本ロジックでは 0 埋め固定
+
+        def _alnum(series: _pd.Series, tag: str):
+            key = (tag, "alnum", id(series))
+            if key in _cache:
+                return _cache[key]
+            s = series.astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+            null_tokens = {"", "nan", "none", "null", "n/a", "na"}
+            s = s.map(lambda x: "" if x.lower() in null_tokens else x)
+            s = s.map(lambda x: re.sub(r"[^A-Za-z0-9]", "", x)).str.upper()
+            _cache[key] = s
+            return s
+
+        def _compose_symcard_any(combined: _pd.Series | None,
+                                 sym_s: _pd.Series | None,
+                                 cno_s: _pd.Series | None,
+                                 tag_combined: str,
+                                 tag_sym: str,
+                                 tag_cno: str):
+            if combined is not None:
+                return _alnum(combined, tag_combined)
+            if sym_s is None and cno_s is None:
+                return _pd.Series([""] * len(remains_src), index=remains_src.index, dtype="object")
+            if sym_s is None:
+                return _alnum(cno_s, tag_cno)
+            if cno_s is None:
+                return _alnum(sym_s, tag_sym)
+            a = _alnum(sym_s, tag_sym)
+            b = _alnum(cno_s, tag_cno)
+            return a.str.cat(b, na_rep="")
+
+        def _to_yyyymmdd(v):
+            """
+            任意の日付表記を 'YYYYMMDD' に正規化するヘルパ。
+            - 空文字 / None → ""
+            - 0 / 00000000 / 00/00/0000 など「0 だけ」で構成される値 → ダミーとして "" 扱い
+            - 99999999 など 9 埋めもダミーとして "" 扱い
+            """
+            try:
+                if v is None:
+                    return ""
+                s = str(v).strip()
+                # 数字だけ取り出して、すべて 0 ならダミー扱い
+                digits_only = re.sub(r"[^0-9]", "", s)
+                if digits_only != "" and set(digits_only) == {"0"}:
+                    return ""
+                d = inspection._parse_date_any_to_yyyymmdd(s)
+                if not d:
+                    return ""
+                d = str(d)
+                # 9 埋め or 0 埋めはどちらもダミー扱い
+                if d and (set(d) == {"9"} or set(d) == {"0"}):
+                    return ""
+                return d
+            except Exception:
+                return ""
+
+        # ---- 4) 幅（患者番号・保険者番号）を決定 ----
+        try:
+            width_pat = cfg.patient_number_width
+            src_pat_digits = _digits(src[src_pat_col], "src_pat_all")
+            width_pat = max(width_pat, int(src_pat_digits.str.len().max() or 0))
+            if "患者番号" in out_df.columns:
+                out_pat_digits = _digits(out_df["患者番号"], "out_pat_all")
+                width_pat = max(width_pat, int(out_pat_digits.str.len().max() or 0))
+            if width_pat <= 0:
+                width_pat = cfg.patient_number_width
+        except Exception:
+            width_pat = cfg.patient_number_width
+        self._log(f"[insurance] 患者番号幅: {width_pat}")
+
+        try:
+            payer_digits = _digits(src[payer_src], "src_payer_all")
+            width_payer = int(payer_digits.str.len().max() or 0)
+        except Exception:
+            width_payer = 0
+        self._log(f"[insurance] 保険者番号幅(参考): {width_payer}")
+
+        # ---- 5) 元データ（対象のみ）側の検索キー作成 ----
+        self._prog_set("検収中…（元データのキーを作成中）")
+        if remains_src.empty:
+            self._log("[insurance] 対象レコードが無いため終了")
+            self._prog_close()
+            return summary
+
+        r = remains_src
+
+        pat_src = r[src_pat_col]
+        payer_src_series = r[payer_src]
+        sym_src_series = r[sym_src] if (sym_src and sym_src in r.columns) else None
+        cno_src_series = r[cno_src] if (cno_src and cno_src in r.columns) else None
+        comb_src_series = r[comb_src] if (comb_src and comb_src in r.columns) else None
+        start_src_series = r[start_src] if (start_src and start_src in r.columns) else None
+        end_src_series = r[end_src] if (end_src and end_src in r.columns) else None
+
+        pat_norm_src = _zfill(pat_src, width_pat, "src_pat")
+        payer_norm_src = _payer_for_mode(payer_src_series, "src_payer")
+        symcard_norm_src = _compose_symcard_any(
+            comb_src_series, sym_src_series, cno_src_series,
+            "src_comb", "src_sym", "src_cno"
+        )
+
+        # 開始日・終了日を保険の移行ルールに合わせて正規化
+        #   - 開始日: 0 / 99999999 / 空欄 → 移行月初(YYYYMM01)
+        #   - 終了日: 0 / 99999999 / 空欄 → 空欄
+        #   - 最終確認日: 0 / 99999999 / 空欄 → 移行日(YYYYMMDD)
+        if start_src_series is not None or end_src_series is not None:
+            # normalize_insurance_dates_for_migration は3本の Series を受け取るため、
+            # 最終確認日は存在しない場合は空の Series で埋める
+            confirm_col = (
+                colmap.get("保険最終確認日")
+                or colmap.get("最終確認日")
+            )
+            if confirm_col and confirm_col in r.columns:
+                confirm_src_series = r[confirm_col]
+            else:
+                confirm_src_series = _pd.Series([""] * len(r), index=r.index)
+
+            start_input = start_src_series if start_src_series is not None else _pd.Series([""] * len(r), index=r.index)
+            end_input = end_src_series if end_src_series is not None else _pd.Series([""] * len(r), index=r.index)
+
+            try:
+                start_norm_src, end_norm_src, _ = normalize_insurance_dates_for_migration(
+                    start_input,
+                    end_input,
+                    confirm_src_series,
+                    mig,
+                )
+            except Exception:
+                # 失敗時は従来どおりのシンプルな日付正規化にフォールバック
+                start_norm_src = start_input.map(_to_yyyymmdd)
+                end_norm_src = end_input.map(_to_yyyymmdd)
+        else:
+            start_norm_src = _pd.Series([""] * len(r), index=r.index)
+            end_norm_src = _pd.Series([""] * len(r), index=r.index)
+
+        key_src = (
+            pat_norm_src.astype(str)
+            .str.cat(payer_norm_src.astype(str), sep="|")
+            .str.cat(symcard_norm_src.astype(str), sep="|")
+            .str.cat(start_norm_src.astype(str), sep="|")
+            .str.cat(end_norm_src.astype(str), sep="|")
+        )
+
+        # ---- 6) 移行後データ側のキー集合を構築 ----
+        self._prog_set("検収中…（移行後データのキーを構築中）")
+        usecols = ["患者番号", "保険者番号"]
+        for c in ["保険証記号", "保険証番号", "記号番号", "保険開始日", "保険終了日", "開始日", "終了日"]:
+            if c in cmp_columns and c not in usecols:
+                usecols.append(c)
+
+        def _read_cmp_chunks(path: str, usecols: list[str], chunksize: int = 200_000):
+            try:
+                for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="utf-8", engine="python"):
+                    yield chunk
+            except Exception:
+                for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="cp932", engine="python", errors="ignore"):
+                    yield chunk
+
+        cmp_keys_set: set[str] = set()
+        cmp_keys_base_set: set[str] = set()
+        total_rows = 0
+        try:
+            for i, chunk in enumerate(_read_cmp_chunks(cmp_path, usecols), start=1):
+                total_rows += len(chunk)
+                pat_c = chunk["患者番号"]
+                payer_c = chunk["保険者番号"]
+                sym_c = chunk["保険証記号"] if "保険証記号" in chunk.columns else None
+                cno_c = chunk["保険証番号"] if "保険証番号" in chunk.columns else None
+                comb_c = chunk["記号番号"] if "記号番号" in chunk.columns else None
+                start_c = (
+                    chunk["保険開始日"]
+                    if "保険開始日" in chunk.columns
+                    else (chunk["開始日"] if "開始日" in chunk.columns else None)
+                )
+                end_c = (
+                    chunk["保険終了日"]
+                    if "保険終了日" in chunk.columns
+                    else (chunk["終了日"] if "終了日" in chunk.columns else None)
+                )
+                confirm_c = (
+                    chunk["最終確認日"]
+                    if "最終確認日" in chunk.columns
+                    else _pd.Series([""] * len(chunk), index=chunk.index)
+                )
+
+                pat_norm_cmp = _zfill(pat_c, width_pat, "cmp_pat")
+                payer_norm_cmp = _payer_for_mode(payer_c, "cmp_payer")
+                symcard_norm_cmp = _compose_symcard_any(
+                    comb_c, sym_c, cno_c,
+                    "cmp_comb", "cmp_sym", "cmp_cno"
+                )
+
+                # 保険開始日・終了日を移行ルールに合わせて正規化
+                if start_c is not None or end_c is not None:
+                    start_input_cmp = start_c if start_c is not None else _pd.Series([""] * len(chunk), index=chunk.index)
+                    end_input_cmp = end_c if end_c is not None else _pd.Series([""] * len(chunk), index=chunk.index)
+                    try:
+                        start_norm_cmp, end_norm_cmp, _ = normalize_insurance_dates_for_migration(
+                            start_input_cmp,
+                            end_input_cmp,
+                            confirm_c,
+                            mig,
+                        )
+                    except Exception:
+                        # フォールバック: 従来のシンプルな正規化
+                        start_norm_cmp = start_input_cmp.map(_to_yyyymmdd)
+                        end_norm_cmp = end_input_cmp.map(_to_yyyymmdd)
+                else:
+                    start_norm_cmp = _pd.Series([""] * len(chunk))
+                    end_norm_cmp = _pd.Series([""] * len(chunk))
+
+                key_cmp = (
+                    pat_norm_cmp.astype(str)
+                    .str.cat(payer_norm_cmp.astype(str), sep="|")
+                    .str.cat(symcard_norm_cmp.astype(str), sep="|")
+                    .str.cat(start_norm_cmp.astype(str), sep="|")
+                    .str.cat(end_norm_cmp.astype(str), sep="|")
+                )
+                # ベースキー（患者番号 + 保険者番号 + 記号番号）も集合として保持し、未ヒット理由判定に使う
+                key_cmp_base = (
+                    pat_norm_cmp.astype(str)
+                    .str.cat(payer_norm_cmp.astype(str), sep="|")
+                    .str.cat(symcard_norm_cmp.astype(str), sep="|")
+                )
+                cmp_keys_set.update(key_cmp.tolist())
+                cmp_keys_base_set.update(key_cmp_base.tolist())
+                if i % 5 == 0:
+                    self._log(f"[insurance] 突合キー構築中… {total_rows:,} 行処理")
+                    self._prog_set(f"検収中…（突合キー構築 {total_rows:,} 行）")
+
+        except Exception as e:
+            self._log(f"[insurance] 突合キー構築でエラー: {type(e).__name__}: {e}")
+
+        self._log(f"[insurance] 突合キー集合 構築完了: {len(cmp_keys_set):,}件")
+
+        # ---- 7) 一致 / 未ヒット算出（対象のみ） ----
+        self._prog_set("検収中…（一致/未ヒットの算出）")
+        matched_mask_src = key_src.isin(cmp_keys_set)
+        missing_mask_src = ~matched_mask_src
+
+        # 対象のみを分割
+        matched_idx = key_src.index[matched_mask_src]
+        missing_idx = key_src.index[missing_mask_src]
+
+        # 未ヒットDF（対象のみ）
+        missing_df = remains_src.loc[missing_idx].copy()
+        try:
+            missing_df.insert(0, "__正規化終了日__", end_norm_src.loc[missing_idx])
+            missing_df.insert(0, "__正規化開始日__", start_norm_src.loc[missing_idx])
+            missing_df.insert(0, "__正規化記号番号__", symcard_norm_src.loc[missing_idx])
+            missing_df.insert(0, "__正規化保険者番号__", payer_norm_src.loc[missing_idx])
+            missing_df.insert(0, "__正規化患者番号__", pat_norm_src.loc[missing_idx])
+        except Exception:
+            pass
+        # 未ヒット理由列の付与
+        try:
+            # 元データ側のベースキー（患者番号 + 保険者番号 + 記号番号）
+            base_key_src = (
+                pat_norm_src.astype(str)
+                .str.cat(payer_norm_src.astype(str), sep="|")
+                .str.cat(symcard_norm_src.astype(str), sep="|")
+            )
+            base_key_missing = base_key_src.loc[missing_idx]
+
+            def _reason_for_missing(k: str) -> str:
+                # ベースキーが比較側に存在する → 日付相違で未ヒット
+                if k in cmp_keys_base_set:
+                    return "開始日・終了日が検収CSVと一致しないため未ヒット"
+                # ベースキー自体が存在しない → 番号（患者/保険者/記号）不一致
+                return "患者番号・保険者番号・記号番号の組み合わせが検収CSVに存在しないため未ヒット"
+
+            reason_series = base_key_missing.map(_reason_for_missing)
+            # 理由列を先頭に追加
+            missing_df.insert(0, "__未ヒット理由__", reason_series)
+        except Exception:
+            # 理由付与で問題があっても検収自体は継続する
+            pass
+
+        # 一致のみDFは out_df から src の index を使って抽出（build_inspection_df が index を継承している前提）
+        try:
+            filtered_out_df = out_df.loc[matched_idx].copy()
+        except Exception as e:
+            self._log(f"[insurance] out_df とのインデックス整合に失敗したため、全件一致扱いを断念: {type(e).__name__}: {e}")
+            filtered_out_df = out_df.head(0).copy()
+
+        self._log(f"[insurance] 未ヒット算出: {len(missing_df)}件")
+        self._log(f"[insurance] 一致のみ算出: {len(filtered_out_df)}件")
+
+        # ---- 8) 出力 ----
+        self._prog_set("書き出し中…（CSV出力）")
+        prefix = "保険"
+
+        try:
+            miss_path = _path_in_dir(f"{prefix}_未ヒット_{today_tag}.csv")
+            inspection.to_csv(missing_df, str(miss_path))
+            summary["missing_count"] = len(missing_df)
+            summary["missing_path"] = str(miss_path)
+            self._log(f"[insurance] 未ヒット出力: {miss_path}")
+        except Exception as e:
+            self._log(f"[insurance] 未ヒット出力に失敗しました: {type(e).__name__}: {e}")
+
+        try:
+            ex_path = _path_in_dir(f"{prefix}_対象外_{today_tag}.csv")
+            inspection.to_csv(excluded_df, str(ex_path))
+            summary["excluded_count"] = len(excluded_df)
+            summary["excluded_path"] = str(ex_path)
+            self._log(f"[insurance] 対象外出力: {ex_path}")
+        except Exception as e:
+            self._log(f"[insurance] 対象外出力に失敗しました: {type(e).__name__}: {e}")
+
+        try:
+            matched_path = _path_in_dir(f"{prefix}_検収_一致のみ_{today_tag}.csv")
+            inspection.to_csv(filtered_out_df, str(matched_path))
+            summary["matched_count"] = len(filtered_out_df)
+            summary["matched_path"] = str(matched_path)
+            self._log(f"[insurance] 一致のみ出力: {matched_path}")
+        except Exception as e:
+            self._log(f"[insurance] 一致のみ出力に失敗しました: {type(e).__name__}: {e}")
+
+        # ---- サマリテキスト出力 ----
+        try:
+            summary_path = _path_in_dir(f"{prefix}_検収_サマリ_{today_tag}.txt")
+            lines: list[str] = []
+            try:
+                ts = _dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                ts = ''
+            lines.append(f"検収サマリ (insurance-simplified) {ts}")
+            try:
+                lines.append(f"比較CSV: {cmp_path}")
+            except Exception:
+                pass
+            lines.append(f"一致のみ: {summary.get('matched_count', 0)}件 -> {summary.get('matched_path')}")
+            lines.append(f"未ヒット: {summary.get('missing_count', 0)}件 -> {summary.get('missing_path')}")
+            lines.append(f"対象外: {summary.get('excluded_count', 0)}件 -> {summary.get('excluded_path')}")
+
+            # 対象外内訳
+            try:
+                if isinstance(excluded_df, pd.DataFrame) and not excluded_df.empty and ("__対象外理由__" in excluded_df.columns):
+                    from collections import Counter
+                    counter = Counter()
+                    for s in excluded_df["__対象外理由__"].astype(str):
+                        if not s:
+                            continue
+                        parts = [x for x in s.split(" / ") if x]
+                        for r in parts:
+                            counter[r] += 1
+                    if counter:
+                        lines.append("")
+                        lines.append("[対象外 内訳]")
+                        for reason, cnt in counter.most_common():
+                            lines.append(f"{reason}\t{cnt}")
+            except Exception:
+                pass
+
+            try:
+                with open(summary_path, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(lines) + "\n")
+                self._log(f"[insurance] サマリ出力: {summary_path}")
+            except Exception as e:
+                self._log(f"[insurance] サマリ出力に失敗しました: {type(e).__name__}: {e}")
+        except Exception:
+            self._log("[insurance] サマリ出力に失敗しました")
+
+        self._prog_close()
+        return summary
+    
+    
     """検収系のUIイベントを集約します。app（DataSurveyApp）に依存します。"""
     COLMAP_FILE = Path.home() / ".datasurvey" / "colmaps.json"
 
@@ -72,6 +654,7 @@ class InspectionActions:
         self._logger = None
         self._migration_provider = None  # callable that returns raw user input for migration date
         self._migration_yyyymmdd: str | None = None  # cached normalized yyyymmdd (shared for 保険/公費)
+        self._insurance_dummy_payer_codes_provider = None  # callable that returns raw user input for dummy payer codes
 
     # プリセット保存・ロード
     def _load_colmaps(self) -> dict:
@@ -101,6 +684,46 @@ class InspectionActions:
         provider_callable: 呼び出し時に文字列を返す関数（例: lambda: entry.get()）
         """
         self._migration_provider = provider_callable
+
+    # 検収ページの「保険者ダミーコード」入力欄から値を取得するためのプロバイダを登録
+    def set_insurance_dummy_payer_codes_provider(self, provider_callable):
+        """
+        provider_callable: 呼び出し時に '39,88,99' のような文字列を返す関数
+        （app.py 側で Entry.get をラップして渡す想定）
+        """
+        self._insurance_dummy_payer_codes_provider = provider_callable
+
+    def _get_insurance_dummy_payer_codes(self) -> list[str]:
+        """
+        UI から入力された保険者ダミーコード（カンマ区切り）をリストで返す。
+        例: "39,88, 99" → ["39", "88", "99"]
+        全角カンマ・全角スペースを含んでいても許容する。
+        """
+        raw = ""
+        if self._insurance_dummy_payer_codes_provider:
+            try:
+                raw = self._insurance_dummy_payer_codes_provider() or ""
+            except Exception:
+                raw = ""
+        # 全角カンマを半角に統一し、カンマで split
+        text = str(raw).replace("，", ",")
+        # 全角スペースも含めて前後空白を削る
+        try:
+            import unicodedata
+            def _strip_all(s: str) -> str:
+                # 全角スペースなども含めて strip
+                return "".join(ch for ch in unicodedata.normalize("NFKC", s)).strip()
+            parts = [ _strip_all(p) for p in text.split(",") ]
+        except Exception:
+            parts = [p.strip() for p in text.split(",")]
+        codes: list[str] = []
+        for p in parts:
+            if not p:
+                continue
+            codes.append(p)
+        if codes:
+            self._log(f"[insurance] UIからダミーコード取得: {codes}")
+        return codes
 
     # コード側から直接移行日を更新したい場合（手動設定用）
     def set_migration_date(self, raw_value: str | None):
@@ -209,7 +832,7 @@ class InspectionActions:
 
     def _prepare_output_dir(self, in_path: str, key_mode: str) -> Path:
         """入力CSV(in_path)のあるフォルダ直下に、検収種別ごとの出力先フォルダを作成して返す。
-        key_mode: "patient" | "insurance" | "public"
+        key_mode: "patient" | "insurance" | "public" | "ceiling"
         例) /path/to/input.csv → /path/to/検収_患者 など
         """
         base = Path(in_path).resolve().parent
@@ -217,7 +840,9 @@ class InspectionActions:
             "patient": "検収_患者",
             "insurance": "検収_保険",
             "public": "検収_公費",
+            "ceiling": "検収_限度額",            
         }
+        
         sub = folder_map.get(key_mode, "検収_その他")
         outdir = base / sub
         outdir.mkdir(parents=True, exist_ok=True)
@@ -285,22 +910,34 @@ class InspectionActions:
                     return src.head(0)
 
                 # UIマッピング → ルール側が期待するキー名へ調整
-                # 期待キー: '患者番号', '保険者番号', '保険証番号', '保険終了日', '生年月日'
+                # 期待キー: '患者番号', '保険者番号', '保険証番号', '保険終了日', '最終確認日', '生年月日'
                 proc_colmap = {
                     "患者番号": colmap.get("患者番号"),
                     "保険者番号": colmap.get("保険者番号"),
                     # 記号+番号を使っている環境では UI 側で『保険証番号』に『記号番号』を割当て済み（ログで確認済み）
                     "保険証番号": colmap.get("保険証番号") or colmap.get("記号番号"),
                     "保険終了日": colmap.get("保険終了日") or colmap.get("終了日"),
+                    # 最終確認日（施設により「保険最終確認日」や「最終確認日」など名称揺れがあり得る）
+                    "最終確認日": (
+                        colmap.get("保険最終確認日")
+                        or colmap.get("最終確認日")
+                    ),
                     "生年月日": colmap.get("生年月日"),
                 }
 
                 # 移行日（YYYYMMDD）を設定
                 mig = migration_yyyymmdd or self._get_migration_date()
-                cfg_rules = InsuranceRuleConfig(migration_yyyymmdd=mig)
+                dummy_codes = self._get_insurance_dummy_payer_codes()
+                cfg_rules = InsuranceRuleConfig(
+                    migration_yyyymmdd=mig,
+                    # 同一患者複数有効保険のうち非優先の判定に使う日付列
+                    # （core.rules.insurance 側で 0 / 99999999 / 空欄 → 移行日 として扱う想定）
+                    duplicate_date_column="最終確認日",
+                    dummy_payer_prefixes=tuple(dummy_codes) if dummy_codes else (),
+                )
 
                 try:
-                    remains, excluded = evaluate_insurance_exclusions(src, proc_colmap, cfg_rules)
+                    remains, excluded = evaluate_insurance_exclusions(df, proc_colmap, cfg_rules)
                 except Exception as e:
                     self._log(f"[insurance] 対象外抽出 例外: {type(e).__name__}: {e}")
                     excluded = pd.DataFrame(columns=["__対象外理由__"])  # 空で返す
@@ -384,11 +1021,29 @@ class InspectionActions:
                     excluded = pd.DataFrame(columns=["__対象外理由__"])  # 空で返す
                 return excluded
 
+            elif key_mode == "ceiling":
+                # 限度額認定証: ルール実装を core.rules.ceiling に一本化
+                try:
+                    from core.rules.ceiling import evaluate_ceiling_exclusions, CeilingRuleConfig
+                except Exception as e:
+                    self._log(f"[ceiling] ルール読込エラー: {type(e).__name__}: {e}")
+                    return src.head(0)
+
+                mig = migration_yyyymmdd or self._get_migration_date()
+                cfg_rules = CeilingRuleConfig(migration_yyyymmdd=mig)
+
+                try:
+                    remains, excluded = evaluate_ceiling_exclusions(src, colmap, cfg_rules)
+                except Exception as e:
+                    self._log(f"[ceiling] 対象外抽出 例外: {type(e).__name__}: {e}")
+                    excluded = pd.DataFrame(columns=["__対象外理由__"])
+
+                return excluded
+
             else:
                 # 不明モード
                 return src.head(0)
 
-            
         except Exception as e:
             # 失敗時は空のDF
             self._log(f"[{key_mode}] 対象外抽出でエラー: {type(e).__name__}: {e}。空データを返します")
@@ -404,6 +1059,7 @@ class InspectionActions:
         - 比較側は必要列のみをチャンク読み（患者番号と副キー）
         - キーは Python タプルではなく '患者|副' の文字列で作成（オブジェクト生成を削減）
         - 同一列の正規化はキャッシュして再利用（digits / zfill / lstrip）
+        key_mode: "patient" | "insurance" | "public" | "ceiling"        
         """
         summary = {
             "matched_count": 0,
@@ -415,11 +1071,20 @@ class InspectionActions:
             "dates_diff_count": 0,
             "dates_diff_path": None,
         }
-
         # 出力用の共通タグ/パス関数（関数前半で定義してどこからでも使えるように）
         today_tag = _dt.now().strftime("%Y%m%d")
         def _path_in_dir(name: str) -> Path:
             return (out_dir / name) if out_dir else Path(name)
+
+        # 保険のみシンプルロジックに委譲
+        if key_mode == "insurance":
+            return self._ask_and_save_missing_and_matched_insurance(
+                src=src,
+                colmap=colmap,
+                out_df=out_df,
+                cfg=cfg,
+                out_dir=out_dir,
+            )
 
         import re, unicodedata
         self._log(f"[{key_mode}] 突合開始")
@@ -754,39 +1419,26 @@ class InspectionActions:
 
                     # 比較側: 開始/終了日を正規化してキーごとに保存（zfillキーに紐付け）
                     try:
-                        def _to_yyyymmdd(v):
-                            try:
-                                d = inspection._parse_date_any_to_yyyymmdd(v)
-                                if not d:
-                                    return ""
-                                d = str(d)
-                                if set(d) == {"9"}:
-                                    return ""
-                                return d
-                            except Exception:
-                                return ""
                         if "保険開始日" in chunk.columns or "保険終了日" in chunk.columns:
-                            s_cmp = chunk["保険開始日"] if "保険開始日" in chunk.columns else None
-                            e_cmp = chunk["保険終了日"] if "保険終了日" in chunk.columns else None
-                            if s_cmp is not None or e_cmp is not None:
-                                s_norm = s_cmp.map(_to_yyyymmdd) if s_cmp is not None else pd.Series([""]*len(chunk))
-                                e_norm = e_cmp.map(_to_yyyymmdd) if e_cmp is not None else pd.Series([""]*len(chunk))
-                                kz_valid = kz.loc[valid]
-                                s_take = s_norm.loc[valid]
-                                e_take = e_norm.loc[valid]
-                                # 非期限切れのみ採用（終了日が空、または移行日以降）
-                                if _mig_for_cmp:
-                                    non_exp_mask = ~((e_take != "") & (e_take < str(_mig_for_cmp)))
-                                else:
-                                    non_exp_mask = pd.Series([True]*len(e_take), index=e_take.index)
-                                kz_valid = kz_valid.loc[non_exp_mask]
-                                s_take = s_take.loc[non_exp_mask]
-                                e_take = e_take.loc[non_exp_mask]
-                                for k, sv, ev in zip(kz_valid.tolist(), s_take.tolist(), e_take.tolist()):
-                                    cand = (sv or "", ev or "")
-                                    prev = cmp_dates_zfill.get(k)
-                                    if prev is None or _prefer_dates(cand, prev):
-                                        cmp_dates_zfill[k] = cand
+                            # すでに normalize_insurance_dates_for_migration で正規化済みの値を利用
+                            s_norm = start_norm_cmp
+                            e_norm = end_norm_cmp
+                            kz_valid = kz.loc[valid]
+                            s_take = s_norm.loc[valid]
+                            e_take = e_norm.loc[valid]
+                            # 非期限切れのみ採用（終了日が空、または移行日以降）
+                            if _mig_for_cmp:
+                                non_exp_mask = ~((e_take != "") & (e_take < str(_mig_for_cmp)))
+                            else:
+                                non_exp_mask = pd.Series([True]*len(e_take), index=e_take.index)
+                            kz_valid = kz_valid.loc[non_exp_mask]
+                            s_take = s_take.loc[non_exp_mask]
+                            e_take = e_take.loc[non_exp_mask]
+                            for k, sv, ev in zip(kz_valid.tolist(), s_take.tolist() , e_take.tolist()):
+                                cand = (sv or "", ev or "")
+                                prev = cmp_dates_zfill.get(k)
+                                if prev is None or _prefer_dates(cand, prev):
+                                    cmp_dates_zfill[k] = cand
                     except Exception:
                         pass
                 else:
@@ -820,7 +1472,7 @@ class InspectionActions:
         src_code_col = colmap.get("患者番号")
         missing_df = pd.DataFrame()
         if src_code_col and src_code_col in src.columns:
-            if key_mode == "patient":
+            if key_mode in ("patient", "ceiling"):
                 src_z = _make_key_str(src[src_code_col], None, width_pat, 0, "zfill", "src_pat", None)
                 mask_missing = (src_z != "") & (~src_z.isin(cmp_keys_zfill_set))
                 if mask_missing.any():
@@ -889,66 +1541,6 @@ class InspectionActions:
                                 missing_df.insert(0, "__正規化患者番号__", _lstrip(src[src_code_col], "src_pat").loc[mask2])
 
         self._log(f"[{key_mode}] 未ヒット算出: {len(missing_df)}件")
-
-        # ---- (診断) 未ヒットの原因内訳を簡易出力（insurance のみ） ----
-        try:
-            if key_mode == "insurance" and isinstance(missing_df, pd.DataFrame) and not missing_df.empty:
-                # 元CSV側の参照列（存在しない場合は空列を作る）
-                src_code_col = colmap.get("患者番号")
-                payer_src = colmap.get("保険者番号") if colmap.get("保険者番号") in src.columns else None
-                comb_src  = colmap.get("記号番号") if colmap.get("記号番号") in src.columns else None
-                sym_src   = colmap.get("保険証記号") if colmap.get("保険証記号") in src.columns else None
-                cno_src   = colmap.get("保険証番号") if colmap.get("保険証番号") in src.columns else None
-
-                # 正規化（患者/保険者/記号番号）
-                pat_norm = missing_df["__正規化患者番号__"] if "__正規化患者番号__" in missing_df.columns else _zfill(src[src_code_col], width_pat, "diag_src_pat").loc[missing_df.index]
-                payer_norm = missing_df["__正規化保険者番号__"] if "__正規化保険者番号__" in missing_df.columns else (_payer_for_mode(src[payer_src], "zfill", "diag_src_payer").loc[missing_df.index] if payer_src else pd.Series([""]*len(missing_df), index=missing_df.index))
-                sc_norm = missing_df["__正規化記号番号__"] if "__正規化記号番号__" in missing_df.columns else (
-                    _alnum(_compose_symcard_any(src.get(comb_src), src.get(sym_src), src.get(cno_src), "diag_src_comb", "diag_src_sym", "diag_src_cno"), "diag_src_sc").loc[missing_df.index]
-                )
-
-                # 空判定
-                pat_empty = pat_norm.eq("")
-                payer_empty = payer_norm.eq("")
-                sc_empty = sc_norm.eq("")
-
-                # CMP 側のキー集合に無いか（zfill キー）
-                src_key = pat_norm.astype(str).str.cat(payer_norm.astype(str), sep="|").str.cat(sc_norm.astype(str), sep="|")
-                in_cmp = src_key.isin(cmp_keys_zfill_set)
-
-                # まとめ
-                diag = pd.DataFrame({
-                    "__正規化患者番号__": pat_norm,
-                    "__正規化保険者番号__": payer_norm,
-                    "__正規化記号番号__": sc_norm,
-                    "__診断:患者空__": pat_empty,
-                    "__診断:保険者空__": payer_empty,
-                    "__診断:記号番号空__": sc_empty,
-                    "__診断:集合に存在__": in_cmp,
-                }, index=missing_df.index)
-
-                # 集計ログ
-                try:
-                    total = len(diag)
-                    c_payer_empty = int(payer_empty.sum())
-                    c_sc_empty = int(sc_empty.sum())
-                    c_pat_empty = int(pat_empty.sum())
-                    c_in_cmp = int(in_cmp.sum())
-                    self._log(f"[insurance][診断] 未ヒット {total} 件 / 患者空 {c_pat_empty} / 保険者空 {c_payer_empty} / 記号番号空 {c_sc_empty} / (正規化キーが比較集合に存在) {c_in_cmp}")
-                except Exception:
-                    pass
-
-                # サンプル 200 件だけ抜粋を保存（全件は未ヒットCSVに含まれるため）
-                try:
-                    sample = diag.head(200).copy()
-                    diag_path = (out_dir / f"保険_未ヒット_診断_{_dt.now().strftime('%Y%m%d')}.csv") if out_dir else Path(f"保険_未ヒット_診断_{_dt.now().strftime('%Y%m%d')}.csv")
-                    inspection.to_csv(sample, str(diag_path))
-                    self._log(f"[insurance][診断] 未ヒット診断サンプルを出力: {diag_path}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
         # ---- 7) 対象外算出（仕様ルール + 未分類編入）----
         excluded_df = pd.DataFrame()
         try:
@@ -959,17 +1551,49 @@ class InspectionActions:
             matched_mask_src = pd.Series([False] * len(src), index=src.index)
             try:
                 if src_code_col and src_code_col in src.columns:
-                    if key_mode == "patient":
+                    if key_mode in ("patient", "ceiling"):
                         src_z_m = _make_key_str(src[src_code_col], None, width_pat, 0, "zfill", "src_pat", None)
                         matched_mask_src = (src_z_m != "") & (src_z_m.isin(cmp_keys_zfill_set))
-                    else:
+                    elif key_mode == "insurance":
+                        # 保険: 患者番号 + 保険者番号 + 記号番号(合成) のトリプルキーで一致行を判定
+                        pat_s   = src[src_code_col]
+                        payer_s = src[payer_src] if (payer_src and payer_src in src.columns) else None
+                        sym_s   = src[sym_src]   if (sym_src and sym_src in src.columns)   else None
+                        cno_s   = src[cno_src]   if (cno_src and cno_src in src.columns)   else None
+                        comb_s  = src[comb_src]  if (comb_src and comb_src in src.columns)  else None
+
+                        if payer_s is not None:
+                            symcard_s = _compose_symcard_any(
+                                comb_s,
+                                sym_s,
+                                cno_s,
+                                "src_comb_match",
+                                "src_sym_match",
+                                "src_cno_match",
+                            )
+                            kz_m = _make_key_triple(
+                                pat_s,
+                                _payer_for_mode(payer_s, "zfill", "src_payer_match"),
+                                symcard_s,
+                                width_pat,
+                                width_sub,
+                                "zfill",
+                                "src_pat_match",
+                                "src_payer_match",
+                                "src_sc_match",
+                            )
+                            valid_m = (
+                                ~_digits(pat_s, "src_pat_match").eq("")
+                                & ~_payer_for_mode(payer_s, "zfill", "src_payer_match").eq("")
+                                & ~_alnum(symcard_s, "src_sc_match").eq("")
+                            )
+                            matched_mask_src = valid_m & kz_m.isin(cmp_keys_zfill_set)
+                    elif key_mode == "public":
                         sub_src = sub_key_name_src
                         if sub_src and sub_src in src.columns:
                             kz = _make_key_str(src[src_code_col], src[sub_src], width_pat, width_sub, "zfill", "src_pat", "src_sub")
                             valid = kz.str.contains(r"\|") & (~kz.str.startswith("|")) & (~kz.str.endswith("|"))
                             matched_mask_src = valid & kz.isin(cmp_keys_zfill_set)
-                if excluded_df is not None and not excluded_df.empty and matched_mask_src.any():
-                    excluded_df = excluded_df.loc[~excluded_df.index.isin(src.index[matched_mask_src])]
             except Exception:
                 pass
 
@@ -980,30 +1604,56 @@ class InspectionActions:
                 unmatched_eligible_mask = eligible_mask_now & (~matched_mask_src)
 
                 if unmatched_eligible_mask.any():
-                    # 正規化キー列が未作成で、missing_df が空の場合はここで作成
-                    if isinstance(missing_df, pd.DataFrame) and missing_df.empty:
-                        unmatched_df = src.loc[unmatched_eligible_mask].copy()
+                    unmatched_idx = src.index[unmatched_eligible_mask]
+
+                    # missing_df が未作成の場合に備えて DataFrame で初期化
+                    if not isinstance(missing_df, pd.DataFrame):
+                        missing_df = pd.DataFrame()
+
+                    # まだ missing_df に含まれていない index を追加
+                    try:
+                        current_idx = set(missing_df.index) if not missing_df.empty else set()
+                        add_idx = [i for i in unmatched_idx if i not in current_idx]
+                    except Exception:
+                        add_idx = list(unmatched_idx)
+
+                    if add_idx:
+                        extra = src.loc[add_idx].copy()
                         # 正規化キー付与
                         try:
+                            # 共通：患者番号
                             if src_code_col and src_code_col in src.columns:
-                                pat_norm = _zfill(src[src_code_col], width_pat, "src_pat")
-                                unmatched_df.insert(0, "__正規化患者番号__", pat_norm.loc[unmatched_eligible_mask])
-                            if key_mode in ("insurance", "public"):
+                                pat_norm_all = _zfill(src[src_code_col], width_pat, "src_pat")
+                                extra.insert(0, "__正規化患者番号__", pat_norm_all.loc[add_idx])
+
+                            if key_mode == "insurance":
+                                # 既に上の方で定義している payer_src / sym_src / cno_src / comb_src を再利用
+                                payer_s = src[payer_src] if (payer_src and payer_src in src.columns) else None
+                                sym_s   = src[sym_src]   if (sym_src and sym_src in src.columns) else None
+                                cno_s   = src[cno_src]   if (cno_src and cno_src in src.columns) else None
+                                comb_s  = src[comb_src]  if (comb_src and comb_src in src.columns) else None
+
+                                if payer_s is not None:
+                                    payer_norm_all = _payer_for_mode(payer_s, "zfill", "src_payer_extra")
+                                    sc_norm_all = _alnum(
+                                        _compose_symcard_any(
+                                            comb_s, sym_s, cno_s,
+                                            "src_comb_extra", "src_sym_extra", "src_cno_extra"
+                                        ),
+                                        "src_sc_extra",
+                                    )
+                                    extra.insert(0, "__正規化記号番号__", sc_norm_all.loc[add_idx])
+                                    extra.insert(0, "__正規化保険者番号__", payer_norm_all.loc[add_idx])
+
+                            elif key_mode == "public":
+                                # 公費：副キーは公費負担者番号
                                 sub_src = sub_key_name_src
-                                if sub_src and sub_src in src.columns:
-                                    sub_norm = _zfill(src[sub_src], width_sub, "src_sub")
-                                    unmatched_df.insert(1, "__正規化副キー__", sub_norm.loc[unmatched_eligible_mask])
+                                if sub_src and sub_src in src.columns and width_sub > 0:
+                                    sub_norm_all = _zfill(src[sub_src], width_sub, "src_sub")
+                                    insert_pos = 1 if "__正規化患者番号__" in extra.columns else 0
+                                    extra.insert(insert_pos, "__正規化副キー__", sub_norm_all.loc[add_idx])
                         except Exception:
                             pass
-                        missing_df = unmatched_df
-
-                    # 未ヒット理由カラムを付与/更新
-                    if isinstance(missing_df, pd.DataFrame):
-                        if "__未ヒット理由__" not in missing_df.columns:
-                            missing_df.insert(0, "__未ヒット理由__", "")
-                        target_idx = missing_df.index.intersection(src.index[unmatched_eligible_mask])
-                        if len(target_idx) > 0:
-                            missing_df.loc[target_idx, "__未ヒット理由__"] = "未分類（未ヒット・要ルール）"
             except Exception:
                 pass
         except Exception:
@@ -1016,6 +1666,7 @@ class InspectionActions:
                 before_cnt = len(missing_df)
                 missing_df = missing_df.loc[~missing_df.index.isin(excluded_df.index)].copy()
                 self._log(f"[{key_mode}] 未ヒット⇔対象外の重複を除外: {before_cnt} → {len(missing_df)}")
+                
         except Exception:
             pass
 
@@ -1023,7 +1674,7 @@ class InspectionActions:
         filtered_out_df = pd.DataFrame()
         try:
             if "患者番号" in out_df.columns:
-                if key_mode == "patient":
+                if key_mode in ("patient", "ceiling"):
                     out_k = _make_key_str(out_df["患者番号"], None, width_pat, 0, "zfill", "out_pat", None)
                     mask_matched = (out_k != "") & (out_k.isin(cmp_keys_zfill_set))
                     filtered_out_df = out_df.loc[mask_matched].copy()
@@ -1059,78 +1710,80 @@ class InspectionActions:
                                     filtered_out_df = out_df.loc[mask2].copy()
 
                 # 正規化キーで重複除去（完全重複のみ落とす）
-                if not filtered_out_df.empty:
-                    try:
-                        if key_mode == "insurance":
-                            # --- 重複キーがある場合: 非期限切れ > 終了日が遅い > 開始日が遅い を優先して1件に絞る ---
-                            # 1) zfillキーを算出
-                            symcard_out = _compose_symcard_any(filtered_out_df.get(comb_out), filtered_out_df.get(sym_out), filtered_out_df.get(cno_out), "out_comb", "out_sym", "out_cno")
-                            key_z = _make_key_triple(
-                                filtered_out_df["患者番号"],
-                                _payer_for_mode(filtered_out_df.get(payer_out), "zfill", "out_payer"),
-                                symcard_out,
-                                width_pat, width_sub, "zfill", "out_pat", "out_payer", "out_sc"
-                            )
+                # if not filtered_out_df.empty:
+                #     try:
+                #         if key_mode == "insurance":
+                #             # --- 重複キーがある場合: 非期限切れ > 終了日が遅い > 開始日が遅い を優先して1件に絞る ---
+                #             # 1) zfillキーを算出
+                #             symcard_out = _compose_symcard_any(filtered_out_df.get(comb_out), filtered_out_df.get(sym_out), filtered_out_df.get(cno_out), "out_comb", "out_sym", "out_cno")
+                #             before_len = len(filtered_out_df)
+                #             key_z = _make_key_triple(
+                #                 filtered_out_df["患者番号"],
+                #                 _payer_for_mode(filtered_out_df.get(payer_out), "zfill", "out_payer"),
+                #                 symcard_out,
+                #                 width_pat, width_sub, "zfill", "out_pat", "out_payer", "out_sc"
+                #             )
 
-                            # 2) out側の開始・終了日を正規化
-                            def _to_yyyymmdd(v):
-                                try:
-                                    d = inspection._parse_date_any_to_yyyymmdd(v)
-                                    if not d:
-                                        return ""
-                                    d = str(d)
-                                    if set(d) == {"9"}:
-                                        return ""
-                                    return d
-                                except Exception:
-                                    return ""
-                            s_norm = (filtered_out_df.get("保険開始日").map(_to_yyyymmdd)
-                                      if "保険開始日" in filtered_out_df.columns else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index))
-                            e_norm = (filtered_out_df.get("保険終了日").map(_to_yyyymmdd)
-                                      if "保険終了日" in filtered_out_df.columns else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index))
-                            # 3) 元の開始日が空欄なら移行月初(YYYYMM01)で比較する
-                            try:
-                                _mig_local = self._get_migration_date()
-                                _mig_month_first = str(_mig_local)[:6] + "01" if _mig_local else None
-                                if _mig_month_first:
-                                    s_norm = s_norm.map(lambda v: _mig_month_first if (v == "") else v)
-                            except Exception:
-                                pass
+                #             # 2) out側の開始・終了日を正規化
+                #             def _to_yyyymmdd(v):
+                #                 try:
+                #                     d = inspection._parse_date_any_to_yyyymmdd(v)
+                #                     if not d:
+                #                         return ""
+                #                     d = str(d)
+                #                     if set(d) == {"9"}:
+                #                         return ""
+                #                     return d
+                #                 except Exception:
+                #                     return ""
+                #             s_norm = (filtered_out_df.get("保険開始日").map(_to_yyyymmdd)
+                #                       if "保険開始日" in filtered_out_df.columns else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index))
+                #             e_norm = (filtered_out_df.get("保険終了日").map(_to_yyyymmdd)
+                #                       if "保険終了日" in filtered_out_df.columns else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index))
+                #             # 3) 元の開始日が空欄なら移行月初(YYYYMM01)で比較する
+                #             try:
+                #                 _mig_local = self._get_migration_date()
+                #                 _mig_month_first = str(_mig_local)[:6] + "01" if _mig_local else None
+                #                 if _mig_month_first:
+                #                     s_norm = s_norm.map(lambda v: _mig_month_first if (v == "") else v)
+                #             except Exception:
+                #                 pass
 
-                            # 4) キー毎に優先レコードを選択
-                            selected_idx = {}
-                            for idx, k, so, eo in zip(filtered_out_df.index, key_z.values, s_norm.values, e_norm.values):
-                                if k not in selected_idx:
-                                    selected_idx[k] = idx
-                                else:
-                                    prev_idx = selected_idx[k]
-                                    so_prev = s_norm.loc[prev_idx]
-                                    eo_prev = e_norm.loc[prev_idx]
-                                    # 既存ヘルパーの優先規則を使用（非期限切れ > 終了日遅い > 開始日遅い）
-                                    if _prefer_dates((so or "", eo or ""), (so_prev or "", eo_prev or "")):
-                                        selected_idx[k] = idx
-                            keep = list(selected_idx.values())
-                            filtered_out_df = filtered_out_df.loc[keep].copy()
-                        elif key_mode == "public":
-                            if out_sub_col in filtered_out_df.columns:
-                                key_l = _make_key_str(filtered_out_df["患者番号"], filtered_out_df[out_sub_col], width_pat, width_sub, "lstrip", "out_pat", "out_sub")
-                                keep_mask = ~key_l.duplicated(keep="first")
-                                filtered_out_df = filtered_out_df.loc[keep_mask].copy()
-                        else:
-                            key_l = _make_key_str(filtered_out_df["患者番号"], None, width_pat, width_sub, "lstrip", "out_pat", None)
-                            keep_mask = ~key_l.duplicated(keep="first")
-                            filtered_out_df = filtered_out_df.loc[keep_mask].copy()
-                    except Exception:
-                        # フォールバック
-                        if key_mode == "insurance":
-                            filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号", payer_out, comb_out, sym_out, cno_out], keep="first")
-                        elif key_mode == "public" and out_sub_col in filtered_out_df.columns:
-                            filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号", out_sub_col], keep="first")
-                        elif key_mode == "patient":
-                            filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号"], keep="first")
+                #             # 4) キー毎に優先レコードを選択
+                #             selected_idx = {}
+                #             for idx, k, so, eo in zip(filtered_out_df.index, key_z.values, s_norm.values, e_norm.values):
+                #                 if k not in selected_idx:
+                #                     selected_idx[k] = idx
+                #                 else:
+                #                     prev_idx = selected_idx[k]
+                #                     so_prev = s_norm.loc[prev_idx]
+                #                     eo_prev = e_norm.loc[prev_idx]
+                #                     # 既存ヘルパーの優先規則を使用（非期限切れ > 終了日遅い > 開始日遅い）
+                #                     if _prefer_dates((so or "", eo or ""), (so_prev or "", eo_prev or "")):
+                #                         selected_idx[k] = idx
+                #             keep = list(selected_idx.values())
+                #             filtered_out_df = filtered_out_df.loc[keep].copy()
+                #             self._log(f"[insurance] 一致キー重複圧縮: {before_len} → {len(filtered_out_df)}")
+                #         elif key_mode == "public":
+                #             if out_sub_col in filtered_out_df.columns:
+                #                 key_l = _make_key_str(filtered_out_df["患者番号"], filtered_out_df[out_sub_col], width_pat, width_sub, "lstrip", "out_pat", "out_sub")
+                #                 keep_mask = ~key_l.duplicated(keep="first")
+                #                 filtered_out_df = filtered_out_df.loc[keep_mask].copy()
+                #         else:
+                #             key_l = _make_key_str(filtered_out_df["患者番号"], None, width_pat, width_sub, "lstrip", "out_pat", None)
+                #             keep_mask = ~key_l.duplicated(keep="first")
+                #             filtered_out_df = filtered_out_df.loc[keep_mask].copy()
+                #     except Exception:
+                #         # フォールバック
+                #         if key_mode == "insurance":
+                #             filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号", payer_out, comb_out, sym_out, cno_out], keep="first")
+                #         elif key_mode == "public" and out_sub_col in filtered_out_df.columns:
+                #             filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号", out_sub_col], keep="first")
+                #         elif key_mode == "patient":
+                #             filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号"], keep="first")
 
                 # ---- 保険開始日・終了日の不一致レポート作成 ----
-                if key_mode == "insurance":
+                # if key_mode == "insurance":
                     try:
                         diff_rows = []
                         if isinstance(filtered_out_df, pd.DataFrame) and not filtered_out_df.empty and cmp_dates_zfill:
@@ -1253,13 +1906,39 @@ class InspectionActions:
                             self._log("[insurance] 開始/終了の不一致: 0件")
                     except Exception as e:
                         self._log(f"[insurance] 開始/終了差分の算出でエラー: {type(e).__name__}: {e}")
+
         except Exception:
             filtered_out_df = pd.DataFrame()
+        # # 仕様上「対象外」と判定された行は「一致」からも除外する（患者/保険/公費/限度額 共通）
+        # try:
+        #     if (
+        #         key_mode in ("patient", "insurance", "public", "ceiling")
+        #         and isinstance(filtered_out_df, pd.DataFrame)
+        #         and not filtered_out_df.empty
+        #         and isinstance(excluded_df, pd.DataFrame)
+        #         and not excluded_df.empty
+        #     ):
+        #         before_cnt = len(filtered_out_df)
+        #         # build_inspection_df が src の index を引き継いでいる前提で、
+        #         # src ベースで対象外になった index を一致側からも除去する
+        #         filtered_out_df = filtered_out_df.loc[~filtered_out_df.index.isin(excluded_df.index)].copy()
+        #         self._log(f"[{key_mode}] 一致⇔対象外の重複を除外: {before_cnt} → {len(filtered_out_df)}")
+        # except Exception:
+        #     # ここでの失敗は致命的ではないため、そのまま続行
+        #     pass
+
         self._log(f"[{key_mode}] 一致のみ算出: {len(filtered_out_df)}件")
 
         # ---- 10) 出力 ----
         self._prog_set("書き出し中…（CSV出力）")
-        prefix = "保険" if key_mode == "insurance" else ("公費" if key_mode == "public" else "患者")
+        if key_mode == "insurance":
+            prefix = "保険"
+        elif key_mode == "public":
+            prefix = "公費"
+        elif key_mode == "ceiling":
+            prefix = "限度額"
+        else:
+            prefix = "患者"
 
         try:
             miss_path = _path_in_dir(f"{prefix}_未ヒット_{today_tag}.csv")
@@ -1579,17 +2258,88 @@ class InspectionActions:
             self._prog_close()
 
     def run_ceiling(self):
-        in_path = filedialog.askopenfilename(title="限度額情報CSVを選択してください", filetypes=[("CSV files", "*.csv")])
+        in_path = filedialog.askopenfilename(title="限度額認定証情報CSVを選択してください", filetypes=[("CSV files", "*.csv")])
         self._log(f"[限度額] 入力CSV: {in_path}")
         if not in_path:
             return False
         try:
-            # ここではまず器だけ用意（後で COLUMNS_CEILING 等に差し替え）
-            messagebox.showinfo("準備中", "限度額の検収CSV生成は現在実装中です。次のステップでロジックを追加します。")
-            return False  # 生成未完了のため内容検収ボタンはまだ有効化しない
+            try:
+                self._prog_open("CSV読み込み中…")
+                src = CsvLoader.read_csv_flex(in_path)
+            finally:
+                self._prog_close()
+
+            out_dir = self._prepare_output_dir(in_path, "ceiling")
+            self._log(f"[限度額] 出力先ディレクトリ: {out_dir}")
+
+            # 限度額認定証用の必須カラムマッピング
+            required_cols = [
+                "患者番号",
+                "患者氏名カナ",
+                "患者氏名",
+                "性別",
+                "生年月日",
+                "限度額認定証適用区分",
+                "限度額認定証開始日",
+                "限度額認定証終了日",
+            ]
+            colmap = self.app._ask_inspection_colmap(src, required_cols=required_cols)
+            if colmap is None:
+                return False
+
+            self._log(f"[限度額] マッピング完了: {colmap}")
+            colmaps = self._load_colmaps()
+            colmaps["ceiling"] = colmap
+            self._save_colmaps(colmaps)
+
+            # 共通の移行日（検収ページ右上の入力欄から取得／キャッシュ）
+            mig = self._get_migration_date()
+            self._log(f"[限度額] 移行日: {mig}")
+
+            cfg = inspection.InspectionConfig(patient_number_width=10)
+            out_df = inspection.build_inspection_df(
+                src,
+                colmap,
+                cfg,
+                target_columns=required_cols,
+            )
+
+            default_name = f"限度額_検収_{_dt.now().strftime('%Y%m%d')}.csv"
+            out_path = filedialog.asksaveasfilename(
+                title="限度額認定証 検収CSVを保存",
+                defaultextension=".csv",
+                initialfile=default_name,
+                initialdir=str(out_dir),
+                filetypes=[("CSV files", "*.csv")]
+            )
+            if not out_path:
+                return False
+
+            self._prog_open("検収CSVを書き出し中…")
+            inspection.to_csv(out_df, out_path)
+            self._prog_close()
+            self._log(f"[限度額] 検収CSV出力: {out_path} (行数 {len(out_df)})")
+
+            # 患者番号をキーに、既存の検収CSVと突合して未ヒット/対象外/一致を作成
+            self._prog_open("検収中…（突合とリスト作成）")
+            summary = self._ask_and_save_missing_and_matched(
+                src=src, colmap=colmap, out_df=out_df, cfg=cfg, key_mode="ceiling", out_dir=out_dir
+            )
+            self._prog_close()
+
+            self._log(f"[限度額] 一致のみ: {summary.get('matched_count', 0)} → {summary.get('matched_path')}")
+            self._log(f"[限度額] 未ヒット: {summary.get('missing_count', 0)} → {summary.get('missing_path')}")
+            self._log(f"[限度額] 対象外: {summary.get('excluded_count', 0)} → {summary.get('excluded_path')}")
+            messagebox.showinfo(
+                "完了",
+                f"出力が完了しました。\n一致: {summary.get('matched_count', 0)} 件 / 未ヒット: {summary.get('missing_count', 0)} 件 / 対象外: {summary.get('excluded_count', 0)} 件"
+            )
+            return True
         except Exception as e:
-            messagebox.showerror("エラー", f"限度額情報の検収処理に失敗しました。\n{e}")
+            messagebox.showerror("エラー", f"限度額認定証情報の検収処理に失敗しました。\n{e}")
             return False
+        finally:
+            self._prog_close()        
 
     def run_missing(self):
         # 単発の未ヒット抽出（元CSV vs 検収CSV）

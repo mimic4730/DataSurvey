@@ -81,17 +81,36 @@ class DataSurveyApp(tk.Tk):
         top_inspect.pack(fill="x", padx=10, pady=(10,6))
 
         ttk.Label(top_inspect, text="検収CSVの生成・突合を実行（ログは下部に出力）").pack(side="left")
-        # ▼ 追加: データ移行日入力（検収全体で共通に使用）
+        # ▼ 追加: データ移行日入力・保険者ダミーコード入力
         right_controls = ttk.Frame(top_inspect)
         right_controls.pack(side="right")
-        ttk.Label(right_controls, text="データ移行日").pack(side="left", padx=(0,4))
-        self.migration_entry = ttk.Entry(right_controls, width=14)
+
+        # データ移行日入力
+        mig_frame = ttk.Frame(right_controls)
+        mig_frame.pack(side="top", anchor="e")
+        ttk.Label(mig_frame, text="データ移行日").pack(side="left", padx=(0, 4))
+        self.migration_entry = ttk.Entry(mig_frame, width=14)
         # 既定値は本日。検収実行時に InspectionActions がこの値を参照して期限切れ判定などに利用
         self.migration_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
         self.migration_entry.pack(side="left")
+
+        # 保険者番号ダミーコード入力（例: "39,88,99" のようにカンマ区切りで指定）
+        dummy_frame = ttk.Frame(right_controls)
+        dummy_frame.pack(side="top", anchor="e", pady=(2, 0))
+        ttk.Label(dummy_frame, text="保険者ダミーコード").pack(side="left", padx=(0, 4))
+        self.ins_dummy_payer_entry = ttk.Entry(dummy_frame, width=20)
+        # 既定値は空。必要に応じて "39,88" などを入力してもらう
+        self.ins_dummy_payer_entry.insert(0, "")
+        self.ins_dummy_payer_entry.pack(side="left")
+
         # InspectionActions に値取得プロバイダを渡す
         if hasattr(self.actions, "set_migration_provider"):
             self.actions.set_migration_provider(lambda: self.migration_entry.get())
+        # 保険者番号ダミーコード用プロバイダ（inspection_actions 側で受け取って InspectionConfig.insurance_dummy_payer_codes に渡す想定）
+        if hasattr(self.actions, "set_insurance_dummy_payer_codes_provider"):
+            self.actions.set_insurance_dummy_payer_codes_provider(
+                lambda: self.ins_dummy_payer_entry.get()
+            )
 
         btns = ttk.Frame(self.page_inspect)
         btns.pack(fill="x", padx=10, pady=(0,6))
