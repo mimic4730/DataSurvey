@@ -17,7 +17,7 @@ class InsuranceRuleConfig:
     require_cardno_if_payer_present: bool = True  # 保険者番号があるとき保険証番号必須
     enforce_law39_cardno_len8: bool = True        # 法別39(8桁)のとき保険証番号は8桁のみ許可
     allowed_payer_prefix_8: tuple[str, ...] = (
-        "01","02","03","04","06","07","39","31","32","33","34","63","72","73","74","75"
+        "01","02","03","04","06","07","39","31","32","33","34","63","67","72","73","74","75"
     )                                             # 8桁時の先頭2桁許容
     check_pref_code_when_8digits: bool = True     # 8桁時の3-4桁(都道府県コード)が01..47か、または6桁の1−2桁
     duplicate_date_column: str | None = "最終確認日"  # 同一患者複数レコードの重複解消に使う日付列（colmap上の論理名）。Noneなら保険終了日を使用
@@ -365,15 +365,27 @@ def evaluate_insurance_exclusions(
             mask_payer_prefix_ng = pd.Series([False]*len(base), index=base.index)
 
         # 5) 都道府県コードチェック
-        #    - 8桁: 3-4桁が都道府県コード(01..47)
-        #    - 6桁: 1-2桁が都道府県コード(01..47)  ※ダミー法別削除後の6桁コードを想定
+        #    - 8桁: 3-4桁が都道府県コード
+        #    - 6桁: 1-2桁が都道府県コード  ※ダミー法別削除後の6桁コードを想定
+        #    医療保険の定義に合わせて、01-47 および 51-97 を許容
         if cfg.check_pref_code_when_8digits:
-            allowed_pref = {f"{i:02d}" for i in range(1, 48)}
-            mask_prefcode_invalid_8 = (payer.str.len() == 8) & (~payer.str[2:4].isin(allowed_pref))
-            mask_prefcode_invalid_6 = (payer.str.len() == 6) & (~payer.str[:2].isin(allowed_pref))
+            # 01〜47
+            allowed_pref_01_47 = {f"{i:02d}" for i in range(1, 48)}
+            # 51〜97
+            allowed_pref_51_97 = {f"{i:02d}" for i in range(51, 98)}
+            allowed_pref = allowed_pref_01_47 | allowed_pref_51_97
+
+            mask_prefcode_invalid_8 = (
+                payer.str.len() == 8
+            ) & (~payer.str[2:4].isin(allowed_pref))
+
+            mask_prefcode_invalid_6 = (
+                payer.str.len() == 6
+            ) & (~payer.str[:2].isin(allowed_pref))
+
             mask_prefcode_invalid = mask_prefcode_invalid_8 | mask_prefcode_invalid_6
         else:
-            mask_prefcode_invalid = pd.Series([False]*len(base), index=base.index)
+            mask_prefcode_invalid = pd.Series([False] * len(base), index=base.index)
 
         # 6) 期限切れ（終了日 < 移行日）
         mig = (cfg.migration_yyyymmdd or "").strip() or None
@@ -447,30 +459,28 @@ def evaluate_insurance_exclusions(
                     # 設定がなければ保険終了日で代用
                     raw_dup = col("保険終了日")
 
-                # データ移行日（YYYYMMDD）。None の場合はランキング上は「00000000」を使う
-                mig_dup = mig  # 上で計算した migration_yyyymmdd をそのまま利用
-
-                # 0 / 99999999 / 空欄 は「データ移行日」とみなすための正規化
+                # VBA の「重複削除（医保・日付順・CSV並び 昇順）」に合わせた
+                # ランキング用の日付値生成:
+                #   - この段階では確認日補填を行わない
+                #   - 空欄 / 0 / 9 埋めは 00000000 として扱い、実日付より常に古い
                 def _dup_rank_value(v: str) -> str:
                     v = "" if v is None else str(v)
-                    # 数字だけ取り出し
-                    dv = "".join([ch for ch in v if ch.isdigit()])
-                    # migration_yyyymmdd が分かっている場合:
-                    #   - 完全に空
-                    #   - 全部 0
-                    #   - 全部 9
-                    # は「移行日」として扱う
-                    if mig_dup:
-                        if dv == "" or set(dv) == {"0"} or set(dv) == {"9"}:
-                            return mig_dup
-                    # 上記以外は通常のゆるい日付パーサで YYYYMMDD 化
+                    # 数字だけ取り出す
+                    dv = "".join(ch for ch in v if ch.isdigit())
+
+                    # 空欄 / 全0 / 全9 → 「日付なし」として 00000000 に揃える
+                    if dv == "" or set(dv) == {"0"} or set(dv) == {"9"}:
+                        return "00000000"
+
+                    # それ以外はゆるい日付パーサで YYYYMMDD に変換
                     try:
                         d = inspection._parse_date_any_to_yyyymmdd(dv or v)
                         if not d:
-                            return mig_dup or "00000000"
+                            # パースできない場合も「日付なし」として扱う
+                            return "00000000"
                         return str(d)
                     except Exception:
-                        return mig_dup or "00000000"
+                        return "00000000"
 
                 dup_date = raw_dup.map(_dup_rank_value).astype(str)
 

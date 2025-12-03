@@ -213,6 +213,7 @@ class InspectionActions:
             例: dummy_payer_prefixes = ("69",) のとき '69NNNNNN' → 'NNNNNN'
             - 空文字はそのまま
             - 接頭語と同じ長さしかない値（例: '69'）は剥がさない
+            - ただし、ダミー接頭語を剥がすのは「8桁かつダミー接頭語に一致する場合のみ」（core.rules.insuranceと同じ仕様）
             """
             key = (tag, "dummy_strip", id(series))
             if key in _cache:
@@ -231,9 +232,11 @@ class InspectionActions:
             def _strip(v: str) -> str:
                 if v == "":
                     return ""
-                for pref in prefixes:
-                    if pref and v.startswith(pref) and len(v) > len(pref):
-                        return v[len(pref):]
+                # insurance.py と同じ仕様: 8桁かつダミー接頭語に一致する場合のみ剥がす
+                if len(v) == 8:
+                    for pref in prefixes:
+                        if pref and v.startswith(pref):
+                            return v[len(pref):]
                 return v
 
             out = base.map(_strip)
@@ -419,6 +422,17 @@ class InspectionActions:
             .str.cat(end_norm_src.astype(str), sep="|")
         )
 
+        # キー判定対象: 患者番号・保険者番号・記号番号がすべて有効な行のみ
+        try:
+            valid_src = (
+                ~_digits(pat_src, "src_pat_for_match").eq("")
+                & ~_payer_for_mode(payer_src_series, "src_payer_for_match").eq("")
+                & (symcard_norm_src != "")
+            )
+        except Exception:
+            # 例外時は従来どおり全件を有効扱い
+            valid_src = pd.Series([True] * len(r), index=r.index)
+
         # ---- 6) 移行後データ側のキー集合を構築 ----
         self._prog_set("検収中…（移行後データのキーを構築中）")
         usecols = ["患者番号", "保険者番号"]
@@ -500,6 +514,8 @@ class InspectionActions:
                     .str.cat(payer_norm_cmp.astype(str), sep="|")
                     .str.cat(symcard_norm_cmp.astype(str), sep="|")
                 )
+                debug_cmp = key_cmp_base[key_cmp_base.str.startswith("0000015064|")]
+                print("[DEBUG cmp keys]", debug_cmp.tolist())
                 cmp_keys_set.update(key_cmp.tolist())
                 cmp_keys_base_set.update(key_cmp_base.tolist())
                 if i % 5 == 0:
@@ -513,8 +529,10 @@ class InspectionActions:
 
         # ---- 7) 一致 / 未ヒット算出（対象のみ） ----
         self._prog_set("検収中…（一致/未ヒットの算出）")
-        matched_mask_src = key_src.isin(cmp_keys_set)
-        missing_mask_src = ~matched_mask_src
+        # キー一致判定は valid_src=True の行のみに限定する
+        matched_raw = key_src.isin(cmp_keys_set)
+        matched_mask_src = matched_raw & valid_src
+        missing_mask_src = (~matched_raw) & valid_src
 
         # 対象のみを分割
         matched_idx = key_src.index[matched_mask_src]
@@ -539,6 +557,10 @@ class InspectionActions:
                 .str.cat(symcard_norm_src.astype(str), sep="|")
             )
             base_key_missing = base_key_src.loc[missing_idx]
+            
+            # ★問題の患者だけ絞る（例：0000015064）
+            debug_target = base_key_missing[base_key_missing.str.startswith("0000015064|")]
+            print("[DEBUG missing keys]", debug_target.tolist())
 
             def _reason_for_missing(k: str) -> str:
                 # ベースキーが比較側に存在する → 日付相違で未ヒット
