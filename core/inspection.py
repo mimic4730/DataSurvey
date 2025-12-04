@@ -315,6 +315,11 @@ def build_inspection_df(
     out["保険終了日"] = end_norm
     out["最終確認日"] = confirm_norm
 
+    # 限度額認定証（限度額検収でのみ使用）
+    out["限度額認定証適用区分"] = get("限度額認定証適用区分")
+    out["限度額認定証開始日"] = get("限度額認定証開始日").map(_parse_date_any_to_yyyymmdd)
+    out["限度額認定証終了日"] = get("限度額認定証終了日").map(_parse_date_any_to_yyyymmdd)
+
     out["公費負担者番号１"] = get("公費負担者番号１")
     out["公費受給者番号１"] = get("公費受給者番号１")
     out["公費開始日１"] = get("公費開始日１").map(_parse_date_any_to_yyyymmdd)

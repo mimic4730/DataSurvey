@@ -1705,6 +1705,41 @@ class InspectionActions:
                         mask2 = (out_k2 != "") & (out_k2.isin(cmp_keys_lstrip_set))
                         if mask2.any():
                             filtered_out_df = out_df.loc[mask2].copy()
+                # ---- 限度額: 終了日が移行日より前のものは「一致のみ」から除外 ----
+                if key_mode == "ceiling" and isinstance(filtered_out_df, pd.DataFrame) and not filtered_out_df.empty:
+                    try:
+                        mig = self._get_migration_date()
+                    except Exception:
+                        mig = None
+                    if mig:
+                        def _to_yyyymmdd_ceiling(v):
+                            try:
+                                d = inspection._parse_date_any_to_yyyymmdd(v)
+                                if not d:
+                                    return ""
+                                d = str(d)
+                                # 0埋め / 9埋めのダミー値は空として扱う
+                                if set(d) == {"0"} or set(d) == {"9"}:
+                                    return ""
+                                return d
+                            except Exception:
+                                return ""
+
+                        end_col = None
+                        for cand in ("限度額認定証終了日", "限度額終了日", "認定証終了日"):
+                            if cand in filtered_out_df.columns:
+                                end_col = cand
+                                break
+
+                        if end_col:
+                            end_norm = filtered_out_df[end_col].map(_to_yyyymmdd_ceiling)
+                            mig_str = str(mig)
+                            mask_expired = (end_norm != "") & (end_norm < mig_str)
+                            if mask_expired.any():
+                                before = len(filtered_out_df)
+                                filtered_out_df = filtered_out_df.loc[~mask_expired].copy()
+                                self._log(f"[ceiling] 終了日が移行日より前の限度額認定証を一致のみから除外: {before} → {len(filtered_out_df)}")
+                                summary["matched_count"] = len(filtered_out_df)
                 else:
                     if key_mode == "insurance":
                         if "患者番号" in out_df.columns and payer_out:
@@ -1730,225 +1765,132 @@ class InspectionActions:
                                 mask2 = valid2 & out_k2.isin(cmp_keys_lstrip_set)
                                 if mask2.any():
                                     filtered_out_df = out_df.loc[mask2].copy()
-
-                # 正規化キーで重複除去（完全重複のみ落とす）
-                # if not filtered_out_df.empty:
-                #     try:
-                #         if key_mode == "insurance":
-                #             # --- 重複キーがある場合: 非期限切れ > 終了日が遅い > 開始日が遅い を優先して1件に絞る ---
-                #             # 1) zfillキーを算出
-                #             symcard_out = _compose_symcard_any(filtered_out_df.get(comb_out), filtered_out_df.get(sym_out), filtered_out_df.get(cno_out), "out_comb", "out_sym", "out_cno")
-                #             before_len = len(filtered_out_df)
-                #             key_z = _make_key_triple(
-                #                 filtered_out_df["患者番号"],
-                #                 _payer_for_mode(filtered_out_df.get(payer_out), "zfill", "out_payer"),
-                #                 symcard_out,
-                #                 width_pat, width_sub, "zfill", "out_pat", "out_payer", "out_sc"
-                #             )
-
-                #             # 2) out側の開始・終了日を正規化
-                #             def _to_yyyymmdd(v):
-                #                 try:
-                #                     d = inspection._parse_date_any_to_yyyymmdd(v)
-                #                     if not d:
-                #                         return ""
-                #                     d = str(d)
-                #                     if set(d) == {"9"}:
-                #                         return ""
-                #                     return d
-                #                 except Exception:
-                #                     return ""
-                #             s_norm = (filtered_out_df.get("保険開始日").map(_to_yyyymmdd)
-                #                       if "保険開始日" in filtered_out_df.columns else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index))
-                #             e_norm = (filtered_out_df.get("保険終了日").map(_to_yyyymmdd)
-                #                       if "保険終了日" in filtered_out_df.columns else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index))
-                #             # 3) 元の開始日が空欄なら移行月初(YYYYMM01)で比較する
-                #             try:
-                #                 _mig_local = self._get_migration_date()
-                #                 _mig_month_first = str(_mig_local)[:6] + "01" if _mig_local else None
-                #                 if _mig_month_first:
-                #                     s_norm = s_norm.map(lambda v: _mig_month_first if (v == "") else v)
-                #             except Exception:
-                #                 pass
-
-                #             # 4) キー毎に優先レコードを選択
-                #             selected_idx = {}
-                #             for idx, k, so, eo in zip(filtered_out_df.index, key_z.values, s_norm.values, e_norm.values):
-                #                 if k not in selected_idx:
-                #                     selected_idx[k] = idx
-                #                 else:
-                #                     prev_idx = selected_idx[k]
-                #                     so_prev = s_norm.loc[prev_idx]
-                #                     eo_prev = e_norm.loc[prev_idx]
-                #                     # 既存ヘルパーの優先規則を使用（非期限切れ > 終了日遅い > 開始日遅い）
-                #                     if _prefer_dates((so or "", eo or ""), (so_prev or "", eo_prev or "")):
-                #                         selected_idx[k] = idx
-                #             keep = list(selected_idx.values())
-                #             filtered_out_df = filtered_out_df.loc[keep].copy()
-                #             self._log(f"[insurance] 一致キー重複圧縮: {before_len} → {len(filtered_out_df)}")
-                #         elif key_mode == "public":
-                #             if out_sub_col in filtered_out_df.columns:
-                #                 key_l = _make_key_str(filtered_out_df["患者番号"], filtered_out_df[out_sub_col], width_pat, width_sub, "lstrip", "out_pat", "out_sub")
-                #                 keep_mask = ~key_l.duplicated(keep="first")
-                #                 filtered_out_df = filtered_out_df.loc[keep_mask].copy()
-                #         else:
-                #             key_l = _make_key_str(filtered_out_df["患者番号"], None, width_pat, width_sub, "lstrip", "out_pat", None)
-                #             keep_mask = ~key_l.duplicated(keep="first")
-                #             filtered_out_df = filtered_out_df.loc[keep_mask].copy()
-                #     except Exception:
-                #         # フォールバック
-                #         if key_mode == "insurance":
-                #             filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号", payer_out, comb_out, sym_out, cno_out], keep="first")
-                #         elif key_mode == "public" and out_sub_col in filtered_out_df.columns:
-                #             filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号", out_sub_col], keep="first")
-                #         elif key_mode == "patient":
-                #             filtered_out_df = filtered_out_df.drop_duplicates(subset=["患者番号"], keep="first")
-
                 # ---- 保険開始日・終了日の不一致レポート作成 ----
-                # if key_mode == "insurance":
-                    try:
-                        diff_rows = []
-                        if isinstance(filtered_out_df, pd.DataFrame) and not filtered_out_df.empty and cmp_dates_zfill:
-                            # out 側のキー（zfill）を再計算
-                            symcard_out2 = _compose_symcard_any(filtered_out_df.get(comb_out), filtered_out_df.get(sym_out), filtered_out_df.get(cno_out), "out_comb", "out_sym", "out_cno")
-                            out_k_z = _make_key_triple(
-                                filtered_out_df["患者番号"],
-                                _payer_for_mode(filtered_out_df.get(payer_out), "zfill", "out_payer"),
-                                symcard_out2,
-                                width_pat, width_sub, "zfill", "out_pat", "out_payer", "out_sc"
-                            )
-                            # out 側の日付を正規化
-                            def _to_yyyymmdd(v):
-                                try:
-                                    d = inspection._parse_date_any_to_yyyymmdd(v)
-                                    if not d:
-                                        return ""
-                                    d = str(d)
-                                    if set(d) == {"9"}:
-                                        return ""
-                                    return d
-                                except Exception:
-                                    return ""
-                            s_out = filtered_out_df.get("保険開始日")
-                            e_out = filtered_out_df.get("保険終了日")
-                            s_out = s_out.map(_to_yyyymmdd) if s_out is not None else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index)
-                            e_out = e_out.map(_to_yyyymmdd) if e_out is not None else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index)
-                            # 元の開始日が空欄なら、移行月初(YYYYMM01)で比較する
+                try:
+                    diff_rows = []
+                    if isinstance(filtered_out_df, pd.DataFrame) and not filtered_out_df.empty and cmp_dates_zfill:
+                        # out 側のキー（zfill）を再計算
+                        symcard_out2 = _compose_symcard_any(filtered_out_df.get(comb_out), filtered_out_df.get(sym_out), filtered_out_df.get(cno_out), "out_comb", "out_sym", "out_cno")
+                        out_k_z = _make_key_triple(
+                            filtered_out_df["患者番号"],
+                            _payer_for_mode(filtered_out_df.get(payer_out), "zfill", "out_payer"),
+                            symcard_out2,
+                            width_pat, width_sub, "zfill", "out_pat", "out_payer", "out_sc"
+                        )
+                        # out 側の日付を正規化
+                        def _to_yyyymmdd(v):
                             try:
-                                mig = self._get_migration_date()
-                                mig_month_first = str(mig)[:6] + "01" if mig else None
-                                if mig_month_first:
-                                    s_out = s_out.map(lambda v: mig_month_first if (v == "") else v)
+                                d = inspection._parse_date_any_to_yyyymmdd(v)
+                                if not d:
+                                    return ""
+                                d = str(d)
+                                if set(d) == {"9"}:
+                                    return ""
+                                return d
                             except Exception:
-                                pass
+                                return ""
+                        s_out = filtered_out_df.get("保険開始日")
+                        e_out = filtered_out_df.get("保険終了日")
+                        s_out = s_out.map(_to_yyyymmdd) if s_out is not None else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index)
+                        e_out = e_out.map(_to_yyyymmdd) if e_out is not None else pd.Series([""]*len(filtered_out_df), index=filtered_out_df.index)
+                        # 元の開始日が空欄なら、移行月初(YYYYMM01)で比較する
+                        try:
+                            mig = self._get_migration_date()
+                            mig_month_first = str(mig)[:6] + "01" if mig else None
+                            if mig_month_first:
+                                s_out = s_out.map(lambda v: mig_month_first if (v == "") else v)
+                        except Exception:
+                            pass
 
-                            for row_i, key_k in zip(out_k_z.index, out_k_z.values):
-                                if key_k in cmp_dates_zfill:
-                                    s_cmp, e_cmp = cmp_dates_zfill.get(key_k, ("", ""))
-                                    so = s_out.loc[row_i]
-                                    eo = e_out.loc[row_i]
-                                    # 期限切れ（元側）が比較に紛れないように、元の終了日が移行日より前なら差分判定をスキップ
-                                    try:
-                                        _mig_for_diff = self._get_migration_date()
-                                    except Exception:
-                                        _mig_for_diff = None
-                                    if _mig_for_diff and (eo != "") and (eo < str(_mig_for_diff)):
-                                        continue
+                        for row_i, key_k in zip(out_k_z.index, out_k_z.values):
+                            if key_k in cmp_dates_zfill:
+                                s_cmp, e_cmp = cmp_dates_zfill.get(key_k, ("", ""))
+                                so = s_out.loc[row_i]
+                                eo = e_out.loc[row_i]
+                                # 期限切れ（元側）が比較に紛れないように、元の終了日が移行日より前なら差分判定をスキップ
+                                try:
+                                    _mig_for_diff = self._get_migration_date()
+                                except Exception:
+                                    _mig_for_diff = None
+                                if _mig_for_diff and (eo != "") and (eo < str(_mig_for_diff)):
+                                    continue
 
-                                    # --- 値の単純一致ではなく、移行日(YYYYMMDD)時点の有効性で差分判定する ---
-                                    try:
-                                        mig_eff = self._get_migration_date()
-                                    except Exception:
-                                        mig_eff = None
+                                # --- 値の単純一致ではなく、移行日(YYYYMMDD)時点の有効性で差分判定する ---
+                                try:
+                                    mig_eff = self._get_migration_date()
+                                except Exception:
+                                    mig_eff = None
 
-                                    def _eff_start(s):
-                                        # 開始日が空なら「昔から有効」とみなす（= 移行日基準で True）
-                                        if not s:
-                                            return True
-                                        if not mig_eff:
-                                            return True
-                                        return s <= str(mig_eff)
+                                def _eff_start(s):
+                                    # 開始日が空なら「昔から有効」とみなす（= 移行日基準で True）
+                                    if not s:
+                                        return True
+                                    if not mig_eff:
+                                        return True
+                                    return s <= str(mig_eff)
 
-                                    def _eff_end(e):
-                                        # 終了日が空なら「期限なし（有効）」とみなす
-                                        if not e:
-                                            return True
-                                        if not mig_eff:
-                                            return True
-                                        return e >= str(mig_eff)
+                                def _eff_end(e):
+                                    # 終了日が空なら「期限なし（有効）」とみなす
+                                    if not e:
+                                        return True
+                                    if not mig_eff:
+                                        return True
+                                    return e >= str(mig_eff)
 
-                                    start_eff_out = _eff_start(so)
-                                    start_eff_cmp = _eff_start(s_cmp)
-                                    end_eff_out   = _eff_end(eo)
-                                    end_eff_cmp   = _eff_end(e_cmp)
+                                start_eff_out = _eff_start(so)
+                                start_eff_cmp = _eff_start(s_cmp)
+                                end_eff_out   = _eff_end(eo)
+                                end_eff_cmp   = _eff_end(e_cmp)
 
-                                    start_eff_diff = (start_eff_out != start_eff_cmp)
-                                    end_eff_diff   = (end_eff_out != end_eff_cmp)
+                                start_eff_diff = (start_eff_out != start_eff_cmp)
+                                end_eff_diff   = (end_eff_out != end_eff_cmp)
 
-                                    # 有効性が同じなら差分としては扱わない（移行ルールに則った比較）
-                                    if not (start_eff_diff or end_eff_diff):
-                                        continue
+                                # 有効性が同じなら差分としては扱わない（移行ルールに則った比較）
+                                if not (start_eff_diff or end_eff_diff):
+                                    continue
 
-                                    # ここから下は「有効性が異なる」場合のみ差分として出力
-                                    if start_eff_diff and end_eff_diff:
-                                        diff_kind = "開始・終了(有効性)"
-                                    elif start_eff_diff:
-                                        diff_kind = "開始(有効性)"
-                                    else:
-                                        diff_kind = "終了(有効性)"
+                                # ここから下は「有効性が異なる」場合のみ差分として出力
+                                if start_eff_diff and end_eff_diff:
+                                    diff_kind = "開始・終了(有効性)"
+                                elif start_eff_diff:
+                                    diff_kind = "開始(有効性)"
+                                else:
+                                    diff_kind = "終了(有効性)"
 
-                                    # 可能なら記号/番号/合成も出力（既存と同様）
-                                    sym_val = filtered_out_df.get("保険証記号").loc[row_i] if (sym_out and sym_out in filtered_out_df.columns) else ""
-                                    cno_val = filtered_out_df.get("保険証番号").loc[row_i] if (cno_out and cno_out in filtered_out_df.columns) else ""
-                                    comb_val = filtered_out_df.get("記号番号").loc[row_i] if ("記号番号" in filtered_out_df.columns) else ""
-                                    payer_val = filtered_out_df.get(payer_out).loc[row_i] if (payer_out and payer_out in filtered_out_df.columns) else ""
-                                    diff_rows.append({
-                                        "患者番号": filtered_out_df["患者番号"].loc[row_i],
-                                        "保険者番号": payer_val,
-                                        "保険証記号": sym_val,
-                                        "保険証番号": cno_val,
-                                        "記号番号": comb_val,
-                                        # 元（= out_df）値も併記
-                                        "元:保険開始日": so,
-                                        "元:保険終了日": eo,
-                                        # 検収（= cmp）値
-                                        "検収:保険開始日": s_cmp,
-                                        "検収:保険終了日": e_cmp,
-                                        "差分種別": diff_kind,
-                                    })
-                        # CSV 出力
-                        if diff_rows:
-                            diff_df = pd.DataFrame(diff_rows)
-                            diff_path = _path_in_dir(f"保険_差異_開始終了_{today_tag}.csv")
-                            inspection.to_csv(diff_df, str(diff_path))
-                            summary["dates_diff_count"] = len(diff_df)
-                            summary["dates_diff_path"] = str(diff_path)
-                            self._log(f"[insurance] 開始/終了の不一致: {len(diff_df)}件 → {diff_path}")
-                        else:
-                            self._log("[insurance] 開始/終了の不一致: 0件")
-                    except Exception as e:
-                        self._log(f"[insurance] 開始/終了差分の算出でエラー: {type(e).__name__}: {e}")
+                                # 可能なら記号/番号/合成も出力（既存と同様）
+                                sym_val = filtered_out_df.get("保険証記号").loc[row_i] if (sym_out and sym_out in filtered_out_df.columns) else ""
+                                cno_val = filtered_out_df.get("保険証番号").loc[row_i] if (cno_out and cno_out in filtered_out_df.columns) else ""
+                                comb_val = filtered_out_df.get("記号番号").loc[row_i] if ("記号番号" in filtered_out_df.columns) else ""
+                                payer_val = filtered_out_df.get(payer_out).loc[row_i] if (payer_out and payer_out in filtered_out_df.columns) else ""
+                                diff_rows.append({
+                                    "患者番号": filtered_out_df["患者番号"].loc[row_i],
+                                    "保険者番号": payer_val,
+                                    "保険証記号": sym_val,
+                                    "保険証番号": cno_val,
+                                    "記号番号": comb_val,
+                                    # 元（= out_df）値も併記
+                                    "元:保険開始日": so,
+                                    "元:保険終了日": eo,
+                                    # 検収（= cmp）値
+                                    "検収:保険開始日": s_cmp,
+                                    "検収:保険終了日": e_cmp,
+                                    "差分種別": diff_kind,
+                                })
+                    # CSV 出力
+                    if diff_rows:
+                        diff_df = pd.DataFrame(diff_rows)
+                        diff_path = _path_in_dir(f"保険_差異_開始終了_{today_tag}.csv")
+                        inspection.to_csv(diff_df, str(diff_path))
+                        summary["dates_diff_count"] = len(diff_df)
+                        summary["dates_diff_path"] = str(diff_path)
+                        self._log(f"[insurance] 開始/終了の不一致: {len(diff_df)}件 → {diff_path}")
+                    else:
+                        self._log("[insurance] 開始/終了の不一致: 0件")
+                except Exception as e:
+                    self._log(f"[insurance] 開始/終了差分の算出でエラー: {type(e).__name__}: {e}")
 
         except Exception:
             filtered_out_df = pd.DataFrame()
-        # # 仕様上「対象外」と判定された行は「一致」からも除外する（患者/保険/公費/限度額 共通）
-        # try:
-        #     if (
-        #         key_mode in ("patient", "insurance", "public", "ceiling")
-        #         and isinstance(filtered_out_df, pd.DataFrame)
-        #         and not filtered_out_df.empty
-        #         and isinstance(excluded_df, pd.DataFrame)
-        #         and not excluded_df.empty
-        #     ):
-        #         before_cnt = len(filtered_out_df)
-        #         # build_inspection_df が src の index を引き継いでいる前提で、
-        #         # src ベースで対象外になった index を一致側からも除去する
-        #         filtered_out_df = filtered_out_df.loc[~filtered_out_df.index.isin(excluded_df.index)].copy()
-        #         self._log(f"[{key_mode}] 一致⇔対象外の重複を除外: {before_cnt} → {len(filtered_out_df)}")
-        # except Exception:
-        #     # ここでの失敗は致命的ではないため、そのまま続行
-        #     pass
-
         self._log(f"[{key_mode}] 一致のみ算出: {len(filtered_out_df)}件")
 
         # ---- 10) 出力 ----
