@@ -320,6 +320,15 @@ def build_inspection_df(
     out["限度額認定証開始日"] = get("限度額認定証開始日").map(_parse_date_any_to_yyyymmdd)
     out["限度額認定証終了日"] = get("限度額認定証終了日").map(_parse_date_any_to_yyyymmdd)
 
+    # 限度額検収（ceiling）でのみ使用:
+    # UI で「限度額認定証適用区分」のマッピングが設定されている場合に限り、
+    # 適用区分が空欄の行は検収対象から除外する。
+    if "限度額認定証適用区分" in colmap:
+        # NaN 由来の "nan" 文字列や空欄も除外する
+        val = out["限度額認定証適用区分"].astype(str).str.strip()
+        mask_ceiling = ~val.str.lower().isin(["", "nan"])
+        out = out.loc[mask_ceiling].copy()
+
     out["公費負担者番号１"] = get("公費負担者番号１")
     out["公費受給者番号１"] = get("公費受給者番号１")
     out["公費開始日１"] = get("公費開始日１").map(_parse_date_any_to_yyyymmdd)
