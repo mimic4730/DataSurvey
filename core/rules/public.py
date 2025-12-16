@@ -70,10 +70,21 @@ def _read_csv_flex(path: str) -> pd.DataFrame:
         return CsvLoader.read_csv_flex(path)
     except Exception:
         pass
+
+    # まず普通に読む
     try:
         return _pd.read_csv(path, dtype=str, encoding="utf-8", engine="python")
     except Exception:
-        return _pd.read_csv(path, dtype=str, encoding="cp932", engine="python", errors="ignore")
+        pass
+
+    # cp932 は open() で decode エラーを握りつぶしてから read_csv に渡す（互換性高い）
+    try:
+        with open(path, "r", encoding="cp932", errors="ignore", newline="") as f:
+            return _pd.read_csv(f, dtype=str, engine="python")
+    except Exception:
+        # 最後の保険（utf-8でも同様に）
+        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+            return _pd.read_csv(f, dtype=str, engine="python")
 
 def _digits_only(s: pd.Series) -> pd.Series:
     import re, unicodedata

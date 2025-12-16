@@ -445,7 +445,7 @@ class InspectionActions:
                 for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="utf-8", engine="python"):
                     yield chunk
             except Exception:
-                for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="cp932", engine="python", errors="ignore"):
+                for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="cp932", engine="python", encoding_errors="replace"):
                     yield chunk
 
         cmp_keys_set: set[str] = set()
@@ -1417,7 +1417,7 @@ class InspectionActions:
                 for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="utf-8", engine="python"):
                     yield chunk
             except Exception:
-                for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="cp932", engine="python", errors="ignore"):
+                for chunk in _pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize, encoding="cp932", engine="python", encoding_errors="replace"):
                     yield chunk
 
         try:
